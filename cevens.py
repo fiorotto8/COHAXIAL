@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-Minimal, extensible CEvNS module with explicit vector and axial pieces.
+Minimal, extensible scattering module for CEvNS and neutrino-electron elastic scattering.
 
 Design goals
 ------------
@@ -37,6 +37,10 @@ is provided.
 
 The exact shell-model / ab-initio S_ij(q^2) tables are NOT hard-coded here.
 You can inject them later as callables or interpolation tables.
+
+The module also includes Standard-Model neutrino-electron elastic scattering,
+which is useful for gas targets such as CF4 where electron recoils can provide
+an additional signal channel.
 """
 
 from dataclasses import dataclass, field
@@ -60,6 +64,7 @@ HBARC_GEV_CM = 1.973269804e-14  # [GeV cm]
 GEV2_TO_CM2 = HBARC_GEV_CM ** 2
 AMU_TO_GEV = 0.93149410242
 FM_TO_GEV_INV = 5.067730716156395
+M_ELECTRON_GEV = 0.510998950e-3
 
 
 def mev_to_gev(x_mev: float) -> float:
@@ -236,7 +241,7 @@ class NuclearTarget:
     J: float
     vector_form_factor: VectorFormFactor
     axial_form_factor: Callable[[float], float] = field(default_factory=ZeroAxialFormFactor)
-    metadata: Dict[str, float | str] = field(default_factory=dict)
+    metadata: Dict[str, float | str] = field(default_factory=dict, compare=False, hash=False)
 
     @property
     def A(self) -> int:
@@ -266,6 +271,10 @@ class StoichiometricMixture:
     name: str
     components: Mapping[NuclearTarget, int]
 
+    @property
+    def electrons_per_molecule(self) -> int:
+        return sum(multiplicity * target.Z for target, multiplicity in self.components.items())
+
     def differential_xs_cm2_per_kev_per_molecule(
         self,
         neutrino_energy_mev: float,
@@ -280,6 +289,33 @@ class StoichiometricMixture:
                 recoil_kev=recoil_kev,
             )
         return total
+
+
+@dataclass(frozen=True)
+class ElectronTarget:
+    name: str = "electron"
+    electrons_per_molecule: int = 1
+    metadata: Dict[str, float | str] = field(default_factory=dict, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        if self.electrons_per_molecule <= 0:
+            raise ValueError("electrons_per_molecule must be positive.")
+
+    @property
+    def mass_gev(self) -> float:
+        return M_ELECTRON_GEV
+
+    def max_recoil_kev(self, neutrino_energy_mev: float) -> float:
+        enu = mev_to_gev(neutrino_energy_mev)
+        recoil_max_gev = 2.0 * enu * enu / (self.mass_gev + 2.0 * enu)
+        return gev_to_kev(recoil_max_gev)
+
+    def min_neutrino_energy_mev(self, recoil_kev: float) -> float:
+        recoil_gev = kev_to_gev(recoil_kev)
+        enu_min_gev = 0.5 * (
+            recoil_gev + math.sqrt(recoil_gev * recoil_gev + 2.0 * self.mass_gev * recoil_gev)
+        )
+        return 1.0e3 * enu_min_gev
 
 
 # =========================
@@ -361,6 +397,110 @@ class CEvNSCalculator:
         return max(value * GEV2_TO_CM2 * 1.0e-6, 0.0)
 
 
+def canonical_neutrino_flavor(flavor: str) -> tuple[str, bool]:
+    key = flavor.strip().lower().replace("-", "").replace("_", "")
+    aliases = {
+        "nue": ("nue", False),
+        "electronneutrino": ("nue", False),
+        "electronnu": ("nue", False),
+        "numu": ("numu", False),
+        "muonneutrino": ("numu", False),
+        "muonnu": ("numu", False),
+        "nutau": ("nutau", False),
+        "tauneutrino": ("nutau", False),
+        "taunu": ("nutau", False),
+        "nuebar": ("nue", True),
+        "antinue": ("nue", True),
+        "electronantineutrino": ("nue", True),
+        "antielectronneutrino": ("nue", True),
+        "numubar": ("numu", True),
+        "antinumu": ("numu", True),
+        "muonantineutrino": ("numu", True),
+        "antimuonneutrino": ("numu", True),
+        "nutaubar": ("nutau", True),
+        "antinutau": ("nutau", True),
+        "tauantineutrino": ("nutau", True),
+        "antitauneutrino": ("nutau", True),
+    }
+
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown neutrino flavor {flavor!r}. Supported examples: "
+            "'nue', 'numu', 'nutau', 'nuebar', 'numubar', 'nutaubar'."
+        )
+    return aliases[key]
+
+
+@dataclass(frozen=True)
+class NeutrinoElectronCalculator:
+    """Standard-Model neutrino-electron elastic scattering calculator."""
+
+    electron_target: ElectronTarget = field(default_factory=ElectronTarget)
+
+    def chiral_couplings(self, flavor: str) -> tuple[float, float, bool]:
+        base_flavor, is_antineutrino = canonical_neutrino_flavor(flavor)
+
+        g_left = -0.5 + SIN2_THETA_W
+        g_right = SIN2_THETA_W
+
+        if base_flavor == "nue":
+            # Add the charged-current contribution for electron flavor.
+            g_left += 1.0
+
+        return g_left, g_right, is_antineutrino
+
+    def is_kinematically_allowed(
+        self,
+        neutrino_energy_mev: float,
+        recoil_kev: float,
+    ) -> bool:
+        return 0.0 <= recoil_kev <= self.electron_target.max_recoil_kev(neutrino_energy_mev)
+
+    def differential_cross_section_cm2_per_kev(
+        self,
+        flavor: str,
+        neutrino_energy_mev: float,
+        recoil_kev: float,
+    ) -> float:
+        if neutrino_energy_mev <= 0.0:
+            return 0.0
+        if recoil_kev < 0.0:
+            return 0.0
+        if not self.is_kinematically_allowed(neutrino_energy_mev, recoil_kev):
+            return 0.0
+
+        enu = mev_to_gev(neutrino_energy_mev)
+        recoil = kev_to_gev(recoil_kev)
+        y = recoil / enu
+
+        g_left, g_right, is_antineutrino = self.chiral_couplings(flavor)
+        leading = g_right if is_antineutrino else g_left
+        subleading = g_left if is_antineutrino else g_right
+
+        prefactor = 2.0 * (GF_GEV ** 2) * self.electron_target.mass_gev / math.pi
+        kinematic = (
+            leading * leading
+            + subleading * subleading * (1.0 - y) ** 2
+            - g_left * g_right * self.electron_target.mass_gev * recoil / (enu * enu)
+        )
+
+        dsig_dT_gev = prefactor * kinematic
+        dsig_dT_cm2_per_gev = dsig_dT_gev * GEV2_TO_CM2
+        dsig_dT_cm2_per_kev = dsig_dT_cm2_per_gev * 1.0e-6
+        return max(dsig_dT_cm2_per_kev, 0.0)
+
+    def differential_cross_section_cm2_per_kev_per_molecule(
+        self,
+        flavor: str,
+        neutrino_energy_mev: float,
+        recoil_kev: float,
+    ) -> float:
+        return (
+            self.electron_target.electrons_per_molecule
+            * self.differential_cross_section_cm2_per_kev(flavor, neutrino_energy_mev, recoil_kev)
+        )
+
+
 # =========================
 # Built-in target factories
 # =========================
@@ -434,6 +574,25 @@ def cf4_molecule(
     carbon = carbon or carbon12_target()
     fluorine = fluorine or fluorine19_target()
     return StoichiometricMixture(name="CF4", components={carbon: 1, fluorine: 4})
+
+
+def electron_target_for_mixture(mixture: StoichiometricMixture) -> ElectronTarget:
+    return ElectronTarget(
+        name=f"{mixture.name} electrons",
+        electrons_per_molecule=mixture.electrons_per_molecule,
+        metadata={
+            "parent_mixture": mixture.name,
+            "electrons_per_molecule": mixture.electrons_per_molecule,
+        },
+    )
+
+
+def cf4_electron_target(
+    *,
+    carbon: Optional[NuclearTarget] = None,
+    fluorine: Optional[NuclearTarget] = None,
+) -> ElectronTarget:
+    return electron_target_for_mixture(cf4_molecule(carbon=carbon, fluorine=fluorine))
 
 
 # =========================

@@ -1,5 +1,6 @@
 {
-  "input_rate_csv": "cevens_rate_output/cf4_differential_rate_per_molecule.csv",
+  "input_nuclear_rate_csv": "cevens_rate_output/cf4_differential_rate_per_molecule.csv",
+  "input_electron_rate_csv": "cevens_rate_output/cf4_electron_differential_rate_per_molecule.csv",
   "output_dir": "detector_rate_output",
   "geometry": {
     "radius_m": 0.25,

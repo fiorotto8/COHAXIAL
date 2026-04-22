@@ -8,7 +8,13 @@ from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cevens import CEvNSCalculator, carbon12_target, fluorine19_target
+from cevens import (
+    CEvNSCalculator,
+    NeutrinoElectronCalculator,
+    cf4_electron_target,
+    carbon12_target,
+    fluorine19_target,
+)
 from ESS_flux import (
     ESSBeamConfig,
     E_NU_MU_PROMPT_MEV,
@@ -18,24 +24,29 @@ from ESS_flux import (
 )
 
 # ============================================================
-# CF4 CEvNS differential-rate scan at an ESS-like pion-DAR source
+# CF4 differential-rate scan at an ESS-like pion-DAR source
 #
 # What this script computes
 # -------------------------
 # For a CF4 molecule, it computes:
 #
-#   dR/dEr  [s^-1 keV^-1 molecule^-1]
+#   dR/dEr  [s^-1 keV^-1 molecule^-1]   for CEvNS nuclear recoils
+#   dR/dTe  [s^-1 keV^-1 molecule^-1]   for neutrino-electron recoils
 #
-# split into:
+# split into source components:
 #   - prompt nu_mu contribution
 #   - delayed nu_e contribution
 #   - delayed anti-nu_mu contribution
 #   - total delayed contribution
 #   - total contribution
 #
-# It also stores separate C and F pieces, and vector / axial split
-# for fluorine, so you can inspect how much of the molecule-level
-# rate is driven by 19F and how large the axial fraction is.
+# For CEvNS it also stores separate C and F pieces, plus the vector / axial
+# split for fluorine, so you can inspect how much of the molecule-level rate
+# is driven by 19F and how large the axial fraction is.
+#
+# For neutrino-electron scattering it stores both per-electron and per-CF4
+# molecule recoil spectra, where the molecule-level rate includes all
+# 42 target electrons in CF4.
 #
 # Normalization
 # -------------
@@ -66,10 +77,15 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 class RateConfig:
     distance_m: float = 20.0
 
-    # recoil-energy grid
+    # nuclear recoil-energy grid for CEvNS
     er_min_kev: float = 0.0
     er_max_kev: float = 120.0
     n_er: int = 1201
+
+    # electron recoil-energy grid for neutrino-electron scattering
+    te_min_kev: float = 0.0
+    te_max_kev: float = 60000.0
+    n_te: int = 3001
 
     # neutrino-energy grid for delayed components
     enu_min_mev: float = 1E-6
@@ -122,6 +138,20 @@ def build_dsigma_vs_enu(
             out[i] = calc.differential_axial_cross_section_cm2_per_kev(target, enu, er_kev)
         else:
             raise ValueError(f"Unknown mode: {mode}")
+
+    return out
+
+
+def build_dsigma_electron_vs_enu(
+    calc: NeutrinoElectronCalculator,
+    flavor: str,
+    enu_grid_mev: np.ndarray,
+    te_kev: float,
+) -> np.ndarray:
+    out = np.zeros_like(enu_grid_mev, dtype=float)
+
+    for i, enu in enumerate(enu_grid_mev):
+        out[i] = calc.differential_cross_section_cm2_per_kev(flavor, enu, te_kev)
 
     return out
 
@@ -213,6 +243,59 @@ def compute_component_rates_per_target(
     out["total_axial"] = out["prompt_axial"] + out["delayed_axial"]
 
     return out
+
+
+def compute_electron_scattering_rates(
+    calc: NeutrinoElectronCalculator,
+    te_grid_kev: np.ndarray,
+    enu_grid_mev: np.ndarray,
+    beam: ESSBeamConfig,
+    distance_m: float,
+) -> Dict[str, np.ndarray]:
+    """
+    Electron-scattering rates:
+        dR/dTe [s^-1 keV^-1]
+
+    Returns both per-electron and per-molecule rates. The molecule-level
+    rates include all target electrons in the configured electron target.
+    """
+    phi_prompt_line = prompt_numu_line_flux(distance_m, beam=beam)  # cm^-2 s^-1
+    phi_nue = differential_flux_delayed(enu_grid_mev, distance_m, "nue", beam=beam)
+    phi_numubar = differential_flux_delayed(enu_grid_mev, distance_m, "numubar", beam=beam)
+
+    n_te = len(te_grid_kev)
+    prompt_per_electron = np.zeros(n_te)
+    nue_per_electron = np.zeros(n_te)
+    numubar_per_electron = np.zeros(n_te)
+
+    for i, te in enumerate(te_grid_kev):
+        ds_prompt = calc.differential_cross_section_cm2_per_kev("numu", E_NU_MU_PROMPT_MEV, te)
+        prompt_per_electron[i] = phi_prompt_line * ds_prompt
+
+        ds_nue = build_dsigma_electron_vs_enu(calc, "nue", enu_grid_mev, te)
+        ds_numubar = build_dsigma_electron_vs_enu(calc, "numubar", enu_grid_mev, te)
+
+        nue_per_electron[i] = integrate_over_enu(enu_grid_mev, phi_nue, ds_nue)
+        numubar_per_electron[i] = integrate_over_enu(enu_grid_mev, phi_numubar, ds_numubar)
+
+    delayed_per_electron = nue_per_electron + numubar_per_electron
+    total_per_electron = prompt_per_electron + delayed_per_electron
+
+    electron_multiplier = float(calc.electron_target.electrons_per_molecule)
+
+    return {
+        "prompt_per_electron": prompt_per_electron,
+        "nue_per_electron": nue_per_electron,
+        "numubar_per_electron": numubar_per_electron,
+        "delayed_per_electron": delayed_per_electron,
+        "total_per_electron": total_per_electron,
+        "prompt_per_molecule": electron_multiplier * prompt_per_electron,
+        "nue_per_molecule": electron_multiplier * nue_per_electron,
+        "numubar_per_molecule": electron_multiplier * numubar_per_electron,
+        "delayed_per_molecule": electron_multiplier * delayed_per_electron,
+        "total_per_molecule": electron_multiplier * total_per_electron,
+        "electrons_per_molecule": np.full(n_te, electron_multiplier),
+    }
 
 
 def integrate_rate_over_recoil(er_grid_kev: np.ndarray, rate_per_s_per_kev: np.ndarray) -> float:
@@ -333,6 +416,46 @@ def write_csv(
             ])
 
 
+def write_electron_csv(
+    filename: str,
+    te_grid_kev: np.ndarray,
+    electron_rates: Dict[str, np.ndarray],
+) -> None:
+    with open(filename, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "Te_keV",
+            "dR_dTe_numu_prompt_per_s_per_keV_per_electron",
+            "dR_dTe_nue_delayed_per_s_per_keV_per_electron",
+            "dR_dTe_numubar_delayed_per_s_per_keV_per_electron",
+            "dR_dTe_delayed_total_per_s_per_keV_per_electron",
+            "dR_dTe_total_per_s_per_keV_per_electron",
+            "dR_dTe_CF4_numu_prompt_per_s_per_keV_per_molecule",
+            "dR_dTe_CF4_nue_delayed_per_s_per_keV_per_molecule",
+            "dR_dTe_CF4_numubar_delayed_per_s_per_keV_per_molecule",
+            "dR_dTe_CF4_delayed_total_per_s_per_keV_per_molecule",
+            "dR_dTe_CF4_total_per_s_per_keV_per_molecule",
+            "CF4_electrons_per_molecule",
+        ])
+
+        for i, te in enumerate(te_grid_kev):
+            writer.writerow([
+                te,
+                electron_rates["prompt_per_electron"][i],
+                electron_rates["nue_per_electron"][i],
+                electron_rates["numubar_per_electron"][i],
+                electron_rates["delayed_per_electron"][i],
+                electron_rates["total_per_electron"][i],
+                electron_rates["prompt_per_molecule"][i],
+                electron_rates["nue_per_molecule"][i],
+                electron_rates["numubar_per_molecule"][i],
+                electron_rates["delayed_per_molecule"][i],
+                electron_rates["total_per_molecule"][i],
+                electron_rates["electrons_per_molecule"][i],
+            ])
+
+
 def plot_cf4_rates(
     filename: str,
     er_grid_kev: np.ndarray,
@@ -358,6 +481,28 @@ def plot_cf4_rates(
     plt.xlabel("Recoil energy [keV]")
     plt.ylabel(r"$dR/dE_r$ [s$^{-1}$ keV$^{-1}$ molecule$^{-1}$]")
     plt.title("CF4 differential CEvNS rate at ESS-like pion-DAR source")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename, dpi=200)
+    plt.close()
+
+
+def plot_cf4_electron_rates(
+    filename: str,
+    te_grid_kev: np.ndarray,
+    electron_rates: Dict[str, np.ndarray],
+) -> None:
+    plt.figure(figsize=(8, 5))
+    plt.plot(te_grid_kev, electron_rates["prompt_per_molecule"], label=r"prompt $\nu_\mu e$")
+    plt.plot(te_grid_kev, electron_rates["nue_per_molecule"], label=r"delayed $\nu_e e$")
+    plt.plot(te_grid_kev, electron_rates["numubar_per_molecule"], label=r"delayed $\bar{\nu}_\mu e$")
+    plt.plot(te_grid_kev, electron_rates["delayed_per_molecule"], "--", label="delayed total")
+    plt.plot(te_grid_kev, electron_rates["total_per_molecule"], linewidth=2, label="total")
+    plt.yscale("log")
+    plt.xlabel("Electron recoil energy [keV]")
+    plt.ylabel(r"$dR/dT_e$ [s$^{-1}$ keV$^{-1}$ molecule$^{-1}$]")
+    plt.title(r"CF4 differential $\nu$-e rate at ESS-like pion-DAR source")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -415,9 +560,12 @@ def print_summary(
     beam: ESSBeamConfig,
     carbon,
     fluorine,
+    electron_target,
     rates_c: Dict[str, np.ndarray],
     rates_f: Dict[str, np.ndarray],
+    electron_rates: Dict[str, np.ndarray],
     er_grid_kev: np.ndarray,
+    te_grid_kev: np.ndarray,
 ) -> None:
     cf4_prompt = rates_c["prompt_total"] + 4.0 * rates_f["prompt_total"]
     cf4_nue = rates_c["nue_total"] + 4.0 * rates_f["nue_total"]
@@ -439,11 +587,23 @@ def print_summary(
     f_piece = integrate_rate_over_recoil(er_grid_kev, 4.0 * rates_f["total"])
     f_molecule_fraction = f_piece / (c_piece + f_piece) if (c_piece + f_piece) > 0.0 else 0.0
 
+    electron_prompt_integrated = integrate_rate_over_recoil(te_grid_kev, electron_rates["prompt_per_molecule"])
+    electron_nue_integrated = integrate_rate_over_recoil(te_grid_kev, electron_rates["nue_per_molecule"])
+    electron_numubar_integrated = integrate_rate_over_recoil(te_grid_kev, electron_rates["numubar_per_molecule"])
+    electron_delayed_integrated = integrate_rate_over_recoil(te_grid_kev, electron_rates["delayed_per_molecule"])
+    electron_total_integrated = integrate_rate_over_recoil(te_grid_kev, electron_rates["total_per_molecule"])
+    electron_above_thr = integrate_rate_above_threshold(
+        te_grid_kev,
+        electron_rates["total_per_molecule"],
+        cfg.threshold_kev,
+    )
+
     print("=== Configuration ===")
     print(f"Distance to source              : {cfg.distance_m:.3f} m")
     print(f"Prompt neutrino energy          : {E_NU_MU_PROMPT_MEV:.6f} MeV")
     print(f"Delayed endpoint                : {E_NU_MAX_MEV:.6f} MeV")
-    print(f"Recoil grid                     : {cfg.er_min_kev:.3f} -> {cfg.er_max_kev:.3f} keV ({cfg.n_er} bins)")
+    print(f"Nuclear recoil grid             : {cfg.er_min_kev:.3f} -> {cfg.er_max_kev:.3f} keV ({cfg.n_er} bins)")
+    print(f"Electron recoil grid            : {cfg.te_min_kev:.3f} -> {cfg.te_max_kev:.3f} keV ({cfg.n_te} bins)")
     print(f"Delayed E_nu grid               : {cfg.enu_min_mev:.3f} -> {cfg.enu_max_mev:.3f} MeV ({cfg.n_enu} bins)")
     print(f"Threshold for summary integral  : {cfg.threshold_kev:.3f} keV")
     print()
@@ -453,9 +613,11 @@ def print_summary(
     print(f"12C: Er_max(delayed endpoint)   : {carbon.max_recoil_kev(E_NU_MAX_MEV):.6f} keV")
     print(f"19F: Er_max(prompt)             : {fluorine.max_recoil_kev(E_NU_MU_PROMPT_MEV):.6f} keV")
     print(f"19F: Er_max(delayed endpoint)   : {fluorine.max_recoil_kev(E_NU_MAX_MEV):.6f} keV")
+    print(f"e- : Te_max(prompt)             : {electron_target.max_recoil_kev(E_NU_MU_PROMPT_MEV):.6f} keV")
+    print(f"e- : Te_max(delayed endpoint)   : {electron_target.max_recoil_kev(E_NU_MAX_MEV):.6f} keV")
     print()
 
-    print("=== CF4 molecule integrated rates ===")
+    print("=== CF4 molecule integrated CEvNS rates ===")
     print(f"Prompt rate                     : {cf4_prompt_integrated:.6e} s^-1 molecule^-1")
     print(f"Delayed rate                    : {cf4_delayed_integrated:.6e} s^-1 molecule^-1")
     print(f"  - nue                         : {integrate_rate_over_recoil(er_grid_kev, cf4_nue):.6e} s^-1 molecule^-1")
@@ -464,11 +626,26 @@ def print_summary(
     print(f"Rate above {cfg.threshold_kev:.3f} keV         : {cf4_above_thr:.6e} s^-1 molecule^-1")
     print()
 
+    print("=== CF4 molecule integrated nu-e rates ===")
+    print(f"Target electrons / molecule     : {electron_target.electrons_per_molecule}")
+    print(f"Prompt rate                     : {electron_prompt_integrated:.6e} s^-1 molecule^-1")
+    print(f"Delayed rate                    : {electron_delayed_integrated:.6e} s^-1 molecule^-1")
+    print(f"  - nue                         : {electron_nue_integrated:.6e} s^-1 molecule^-1")
+    print(f"  - numubar                     : {electron_numubar_integrated:.6e} s^-1 molecule^-1")
+    print(f"Total rate                      : {electron_total_integrated:.6e} s^-1 molecule^-1")
+    print(f"Rate above {cfg.threshold_kev:.3f} keV         : {electron_above_thr:.6e} s^-1 molecule^-1")
+    print()
+
     print("=== Useful derived fractions ===")
     print(f"Prompt / total                  : {cf4_prompt_integrated / cf4_total_integrated:.6f}" if cf4_total_integrated > 0 else "Prompt / total                  : 0")
     print(f"Delayed / total                 : {cf4_delayed_integrated / cf4_total_integrated:.6f}" if cf4_total_integrated > 0 else "Delayed / total                 : 0")
     print(f"4F contribution / CF4 total     : {f_molecule_fraction:.6f}")
     print(f"19F axial / 19F total           : {f_axial_fraction:.6f}")
+    print(
+        f"nu-e / CEvNS above threshold    : {electron_above_thr / cf4_above_thr:.6f}"
+        if cf4_above_thr > 0.0
+        else "nu-e / CEvNS above threshold    : 0"
+    )
     print()
 
     print("=== Beam numbers ===")
@@ -482,6 +659,8 @@ def main() -> None:
     cfg = RateConfig()
     beam = ESSBeamConfig()
     calc = CEvNSCalculator()
+    electron_target = cf4_electron_target()
+    electron_calc = NeutrinoElectronCalculator(electron_target=electron_target)
 
     carbon = carbon12_target()
     fluorine = fluorine19_target(
@@ -492,6 +671,7 @@ def main() -> None:
     )
 
     er_grid_kev = np.linspace(cfg.er_min_kev, cfg.er_max_kev, cfg.n_er)
+    te_grid_kev = np.linspace(cfg.te_min_kev, cfg.te_max_kev, cfg.n_te)
     enu_grid_mev = np.linspace(cfg.enu_min_mev, cfg.enu_max_mev, cfg.n_enu)
 
     rates_c = compute_component_rates_per_target(
@@ -512,22 +692,47 @@ def main() -> None:
         distance_m=cfg.distance_m,
     )
 
+    electron_rates = compute_electron_scattering_rates(
+        calc=electron_calc,
+        te_grid_kev=te_grid_kev,
+        enu_grid_mev=enu_grid_mev,
+        beam=beam,
+        distance_m=cfg.distance_m,
+    )
+
     csv_file = os.path.join(OUTPUT_DIR, "cf4_differential_rate_per_molecule.csv")
+    electron_csv_file = os.path.join(OUTPUT_DIR, "cf4_electron_differential_rate_per_molecule.csv")
     fig_rate = os.path.join(OUTPUT_DIR, "cf4_differential_rate_components.png")
+    fig_electron_rate = os.path.join(OUTPUT_DIR, "cf4_electron_differential_rate_components.png")
     fig_comp = os.path.join(OUTPUT_DIR, "cf4_composition_c_vs_4f.png")
     fig_ax = os.path.join(OUTPUT_DIR, "fluorine_axial_fraction_flux_folded.png")
 
     write_csv(csv_file, er_grid_kev, rates_c, rates_f)
+    write_electron_csv(electron_csv_file, te_grid_kev, electron_rates)
     plot_cf4_rates(fig_rate, er_grid_kev, rates_c, rates_f)
+    plot_cf4_electron_rates(fig_electron_rate, te_grid_kev, electron_rates)
     plot_cf4_composition(fig_comp, er_grid_kev, rates_c, rates_f)
     plot_fluorine_axial_fraction(fig_ax, er_grid_kev, rates_f)
 
-    print_summary(cfg, beam, carbon, fluorine, rates_c, rates_f, er_grid_kev)
+    print_summary(
+        cfg,
+        beam,
+        carbon,
+        fluorine,
+        electron_target,
+        rates_c,
+        rates_f,
+        electron_rates,
+        er_grid_kev,
+        te_grid_kev,
+    )
 
     print()
     print("Saved files:")
     print(f"  {csv_file}")
+    print(f"  {electron_csv_file}")
     print(f"  {fig_rate}")
+    print(f"  {fig_electron_rate}")
     print(f"  {fig_comp}")
     print(f"  {fig_ax}")
 
