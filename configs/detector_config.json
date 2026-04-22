@@ -1,0 +1,16 @@
+{
+  "input_rate_csv": "cevens_rate_output/cf4_differential_rate_per_molecule.csv",
+  "output_dir": "detector_rate_output",
+  "geometry": {
+    "radius_m": 0.25,
+    "length_m": 0.5
+  },
+  "fiducial_fraction": 0.75,
+  "gas": {
+    "pressure_mbar": 10000.0,
+    "temperature_K": 293.15
+  },
+  "analysis": {
+    "energy_threshold_kev": 10.0
+  }
+}

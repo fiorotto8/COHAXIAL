@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 *.pyd   
 ess_flux_output/
+detector_rate_output/
 *.png
 *.csv
