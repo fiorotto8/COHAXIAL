@@ -9,8 +9,10 @@ Design goals
   and the cross-section calculator.
 - Safe defaults for spin-zero nuclei (e.g. 12C => axial = 0).
 - A generic exact interface for the axial structure functions S_00, S_01, S_11.
-- A simple approximate axial model for 19F, useful for fast studies until a full
-  shell-model table is plugged in.
+- Two literature-backed Hoferichter/Menendez/Schwenk 19F axial levels:
+  a fast polynomial-fit transverse response and a central response including
+  delta0/delta00 corrections.
+- A deliberately simple toy axial model for debugging only.
 - Units chosen for convenience in phenomenology:
     * neutrino energy: MeV
     * recoil energy: keV
@@ -35,8 +37,12 @@ For the axial term, a generic implementation of
 
 is provided.
 
-The exact shell-model / ab-initio S_ij(q^2) tables are NOT hard-coded here.
-You can inject them later as callables or interpolation tables.
+For 19F, the built-in Hoferichter models follow arXiv:2007.08529 / PRD 102
+(2020): Eq. (66) for the vector+axial CEvNS split, Eq. (67) for F_A,
+Eqs. (80)-(85) for S00/S01/S11, Eq. (86) for delta0/delta00, Table I for
+gA/gAs/rA, Table V for two-body-current central inputs, Table VIII for the
+19F polynomial response coefficients and b, and Table IV only as a q2 -> 0
+spin-expectation cross-check.
 
 The module also includes Standard-Model neutrino-electron elastic scattering,
 which is useful for gas targets such as CF4 where electron recoils can provide
@@ -60,6 +66,21 @@ G_V_PROTON = 0.5 - 2.0 * SIN2_THETA_W
 G_V_NEUTRON = -0.5
 G_A_NUCLEON = 1.27
 G_A_STRANGE_DEFAULT = 0.0
+HOFERICHTER_G_A = 1.27641
+HOFERICHTER_G_A_STRANGE_FAST = 0.0
+HOFERICHTER_G_A_STRANGE_CENTRAL = -0.085
+HOFERICHTER_AXIAL_RADIUS_SQ_FM2 = 0.46
+HOFERICHTER_RHO_CENTRAL_FM3 = 0.10
+HOFERICHTER_C1_GEV_INV = -1.20
+HOFERICHTER_C3_GEV_INV = -4.45
+HOFERICHTER_C4_GEV_INV = 2.96
+HOFERICHTER_C6_GEV_INV = 5.01
+HOFERICHTER_CD_CENTRAL = 0.5 * (-6.08 + 0.30)
+HOFERICHTER_LAMBDA_CHI_GEV = 0.700
+F_PI_GEV = 0.09228
+M_PI_GEV = 0.13957039
+M_NUCLEON_GEV = 0.938918754
+G_PI_NN = math.sqrt(4.0 * math.pi * 13.7)
 HBARC_GEV_CM = 1.973269804e-14  # [GeV cm]
 GEV2_TO_CM2 = HBARC_GEV_CM ** 2
 AMU_TO_GEV = 0.93149410242
@@ -193,17 +214,322 @@ class GenericAxialFormFactor:
 
 
 @dataclass(frozen=True)
-class SpinExpectationAxialApprox:
-    """Fast approximate axial model.
+class AxialResponsePolynomial:
+    """Polynomial shell-model response fit using the Appendix E convention."""
 
-    This approximation keeps the dominant isovector zero-momentum normalization and multiplies it by
-    an ad-hoc dipole-like falloff. It is useful for feasibility studies and software development, but
-    it should be replaced by shell-model / tabulated S_ij(q^2) for proposal-grade results.
+    coefficients: tuple[float, ...]
+
+    def __call__(self, u: float) -> float:
+        polynomial = sum(coef * (u ** i) for i, coef in enumerate(self.coefficients))
+        return math.exp(-0.5 * u) * polynomial
+
+
+class HoferichterDeltaCorrections(Protocol):
+    def delta0(self, q2_gev2: float) -> float:
+        ...
+
+    def delta00(self, q2_gev2: float) -> float:
+        ...
+
+
+@dataclass(frozen=True)
+class HoferichterCentralDeltaCorrections:
+    """Central delta0/delta00 prescription for the detailed 19F model.
+
+    Implements Hoferichter, Menendez, Schwenk Eq. (86), with the two-body
+    current pieces delta a(q^2) and delta a^P(q^2) from Eqs. (75)-(76).
+    Central inputs are from Table I (gA, g_A^{s,N}, axial radius,
+    F_pi, g_piNN) and Table V (rho, c1, c3, c4, c6, cD). The contact
+    cD is fixed to the midpoint of the Table V range for this single
+    central-value option; uncertainty scans are left to a future layer.
+    """
+
+    rho_fm3: float = HOFERICHTER_RHO_CENTRAL_FM3
+    c1_gev_inv: float = HOFERICHTER_C1_GEV_INV
+    c3_gev_inv: float = HOFERICHTER_C3_GEV_INV
+    c4_gev_inv: float = HOFERICHTER_C4_GEV_INV
+    c6_gev_inv: float = HOFERICHTER_C6_GEV_INV
+    cD: float = HOFERICHTER_CD_CENTRAL
+    gA: float = HOFERICHTER_G_A
+    axial_radius_sq_fm2: float = HOFERICHTER_AXIAL_RADIUS_SQ_FM2
+    f_pi_gev: float = F_PI_GEV
+    m_pi_gev: float = M_PI_GEV
+    m_nucleon_gev: float = M_NUCLEON_GEV
+    g_pi_nn: float = G_PI_NN
+    lambda_chi_gev: float = HOFERICHTER_LAMBDA_CHI_GEV
+
+    @property
+    def rho_gev3(self) -> float:
+        return self.rho_fm3 / (FM_TO_GEV_INV ** 3)
+
+    @property
+    def kf_gev(self) -> float:
+        return ((3.0 * math.pi * math.pi * self.rho_gev3) / 2.0) ** (1.0 / 3.0)
+
+    @property
+    def axial_radius_sq_gev_inv2(self) -> float:
+        return self.axial_radius_sq_fm2 * (FM_TO_GEV_INV ** 2)
+
+    def _arccot(self, x: float) -> float:
+        return math.atan2(1.0, x)
+
+    def _log_ratio(self, q_gev: float) -> float:
+        kf = self.kf_gev
+        mpi = self.m_pi_gev
+        numerator = mpi * mpi + (kf - 0.5 * q_gev) ** 2
+        denominator = mpi * mpi + (kf + 0.5 * q_gev) ** 2
+        return math.log(numerator / denominator)
+
+    def _fermi_gas_integrals(self, q_gev: float) -> tuple[float, float, float, float]:
+        """Klos/Menendez/Gazit/Schwenk exchange integrals used in Eqs. (75)-(76).
+
+        The analytic expressions are quoted in Appendix B of Klos et al.,
+        Phys. Rev. D 88, 083516 (2013), which is the formalism referenced by
+        Hoferichter et al. around Eqs. (75)-(76). All momenta are in GeV, so
+        the integrals are dimensionless.
+        """
+
+        kf = self.kf_gev
+        mpi = self.m_pi_gev
+        if abs(q_gev) < 1e-4:
+            common = 1.0 - 3.0 * (mpi ** 2) / (kf ** 2) + 3.0 * (mpi ** 3) / (kf ** 3) * math.atan(kf / mpi)
+            return common, common, 0.0, 0.0
+
+        q = q_gev
+        q2 = q * q
+        k2 = kf * kf
+        m2 = mpi * mpi
+        acot = self._arccot((m2 + 0.25 * q2 - k2) / (2.0 * mpi * kf))
+        log_ratio = self._log_ratio(q)
+
+        i_sigma1 = (
+            8.0 * kf * q * (48.0 * (k2 + m2) ** 2 + 32.0 * (k2 - 3.0 * m2) * q2 - 3.0 * q2 * q2)
+            + 768.0 * (mpi ** 3) * (q ** 3) * acot
+            + 3.0
+            * (16.0 * (k2 + m2) ** 2 - 8.0 * (k2 - 5.0 * m2) * q2 + q2 * q2)
+            * (4.0 * (k2 + m2) - q2)
+            * log_ratio
+        ) / (512.0 * (kf ** 3) * (q ** 3))
+
+        i_sigma2 = (
+            8.0 * kf * (2.0 * k2 - 3.0 * m2) * q
+            + 24.0 * (mpi ** 3) * q * acot
+            + 3.0 * m2 * (4.0 * k2 - q2 + 4.0 * m2) * log_ratio
+        ) / (16.0 * (kf ** 3) * q)
+
+        i_p = -(
+            8.0 * kf * q * (48.0 * (k2 + m2) ** 2 - 32.0 * k2 * q2 - 3.0 * q2 * q2)
+            + 3.0
+            * (4.0 * (k2 + m2) - q2)
+            * (4.0 * m2 + (2.0 * kf - q) ** 2)
+            * (4.0 * m2 + (2.0 * kf + q) ** 2)
+            * log_ratio
+        ) * 3.0 / (512.0 * (kf ** 3) * (q ** 3))
+
+        i_c6 = -(
+            32.0 * (kf ** 3) * q
+            + 32.0 * kf * m2 * q
+            + 8.0 * kf * (q ** 3)
+            + (16.0 * (k2 + m2) ** 2 + 8.0 * (m2 - k2) * q2 + q2 * q2)
+            * math.log((4.0 * m2 + (2.0 * kf - q) ** 2) / (4.0 * m2 + (2.0 * kf + q) ** 2))
+        ) * 9.0 / (128.0 * (kf ** 3) * q)
+
+        return i_sigma1, i_sigma2, i_p, i_c6
+
+    def two_body_delta_a(self, q2_gev2: float) -> float:
+        q2 = max(q2_gev2, 0.0)
+        q = math.sqrt(q2)
+        i1, i2, _ip, ic6 = self._fermi_gas_integrals(q)
+        bracket = (
+            (self.c4_gev_inv / 3.0) * (3.0 * i2 - i1)
+            - ((self.c3_gev_inv - 1.0 / (4.0 * self.m_nucleon_gev)) / 3.0) * i1
+            - (self.c6_gev_inv / 12.0) * ic6
+            - self.cD / (4.0 * self.gA * self.lambda_chi_gev)
+        )
+        return -(self.rho_gev3 / (self.f_pi_gev ** 2)) * bracket
+
+    def two_body_delta_a_p(self, q2_gev2: float) -> float:
+        q2 = max(q2_gev2, 0.0)
+        q = math.sqrt(q2)
+        i1, i2, ip, ic6 = self._fermi_gas_integrals(q)
+        pion_den = self.m_pi_gev ** 2 + q2
+        bracket = (
+            -2.0 * (self.c3_gev_inv - 2.0 * self.c1_gev_inv) * (self.m_pi_gev ** 2) * q2 / (pion_den ** 2)
+            + ((self.c3_gev_inv + self.c4_gev_inv - 1.0 / (4.0 * self.m_nucleon_gev)) / 3.0) * ip
+            - (self.c6_gev_inv / 12.0 - (2.0 / 3.0) * self.c1_gev_inv * (self.m_pi_gev ** 2) / pion_den) * ic6
+            - (q2 / pion_den)
+            * (
+                (self.c3_gev_inv / 3.0) * (i1 + ip)
+                + (self.c4_gev_inv / 3.0) * (i1 + ip - 3.0 * i2)
+            )
+            - self.cD / (4.0 * self.gA * self.lambda_chi_gev) * q2 / pion_den
+        )
+        return (self.rho_gev3 / (self.f_pi_gev ** 2)) * bracket
+
+    def delta0(self, q2_gev2: float) -> float:
+        q2 = max(q2_gev2, 0.0)
+        return -q2 * self.axial_radius_sq_gev_inv2 / 6.0 + self.two_body_delta_a(q2)
+
+    def delta00(self, q2_gev2: float) -> float:
+        q2 = max(q2_gev2, 0.0)
+        pion_pole = -(
+            self.g_pi_nn * self.f_pi_gev / (self.gA * self.m_nucleon_gev)
+        ) * q2 / (q2 + self.m_pi_gev ** 2)
+        return pion_pole + self.two_body_delta_a(q2) + self.two_body_delta_a_p(q2)
+
+
+@dataclass(frozen=True)
+class Hoferichter19FTransverseStructureFunctions:
+    """19F transverse axial structure functions from Hoferichter et al.
+
+    Uses Appendix E / Table VIII coefficients from Hoferichter, Menendez,
+    Schwenk, "Coherent elastic neutrino-nucleus scattering: EFT analysis and
+    nuclear responses", arXiv:2007.08529 / PRD 102 (2020).
+
+    Eqs. (80)-(85) form S00/S01/S11 from proton/neutron transverse responses.
+    The fast model sets delta0=delta00=0; the central model passes explicit
+    Eq. (86) corrections through the corrections object.
+    With gAs=0 and no delta corrections, the polynomial-fit coefficients give
+    FA(0) around 2.25 for the Eq. (67) normalization. This is the same
+    q2 -> 0 logic as the Table IV spin-expectation cross-check, but the
+    polynomial response is the model input used here.
+    """
+
+    b_fm: float = 1.7623
+    corrections: Optional[HoferichterDeltaCorrections] = None
+    sigma_prime_p: AxialResponsePolynomial = field(
+        default_factory=lambda: AxialResponsePolynomial((0.269513, -0.18098, 0.0296873))
+    )
+    sigma_prime_n: AxialResponsePolynomial = field(
+        default_factory=lambda: AxialResponsePolynomial((-0.00113172, 0.00038188, 0.000744991))
+    )
+    sigma_double_prime_p: AxialResponsePolynomial = field(
+        default_factory=lambda: AxialResponsePolynomial((0.190574, -0.125204, 0.0206132))
+    )
+    sigma_double_prime_n: AxialResponsePolynomial = field(
+        default_factory=lambda: AxialResponsePolynomial((-0.000800244, 0.00106046, -0.000167277))
+    )
+
+    def u(self, q2_gev2: float) -> float:
+        if q2_gev2 <= 0.0:
+            return 0.0
+        q_gev = math.sqrt(q2_gev2)
+        q_fm_inv = q_gev * FM_TO_GEV_INV
+        return 0.5 * (q_fm_inv ** 2) * (self.b_fm ** 2)
+
+    def _structure_factors(self, q2_gev2: float) -> tuple[float, float, float]:
+        u = self.u(q2_gev2)
+
+        sigma_prime_p = self.sigma_prime_p(u)
+        sigma_prime_n = self.sigma_prime_n(u)
+        sigma_double_prime_p = self.sigma_double_prime_p(u)
+        sigma_double_prime_n = self.sigma_double_prime_n(u)
+
+        # Eq. (85): isoscalar/isovector combinations F^+ = F^p + F^n,
+        # F^- = F^p - F^n. For 19F, the Table VIII sum over L has only L=1.
+        sigma_prime_plus = sigma_prime_p + sigma_prime_n
+        sigma_prime_minus = sigma_prime_p - sigma_prime_n
+        sigma_double_prime_plus = sigma_double_prime_p + sigma_double_prime_n
+        sigma_double_prime_minus = sigma_double_prime_p - sigma_double_prime_n
+
+        if self.corrections is None:
+            delta0 = 0.0
+            delta00 = 0.0
+        else:
+            delta0 = self.corrections.delta0(q2_gev2)
+            delta00 = self.corrections.delta00(q2_gev2)
+
+        s00 = sigma_prime_plus ** 2 + sigma_double_prime_plus ** 2
+        s11 = ((1.0 + delta0) * sigma_prime_minus) ** 2 + ((1.0 + delta00) * sigma_double_prime_minus) ** 2
+        s01 = (
+            2.0 * (1.0 + delta0) * sigma_prime_plus * sigma_prime_minus
+            + 2.0 * (1.0 + delta00) * sigma_double_prime_plus * sigma_double_prime_minus
+        )
+        return s00, s01, s11
+
+    def s00(self, q2_gev2: float) -> float:
+        return self._structure_factors(q2_gev2)[0]
+
+    def s01(self, q2_gev2: float) -> float:
+        return self._structure_factors(q2_gev2)[1]
+
+    def s11(self, q2_gev2: float) -> float:
+        return self._structure_factors(q2_gev2)[2]
+
+
+@dataclass(frozen=True)
+class Hoferichter19FFastAxial:
+    """Fast default 19F axial form factor from Hoferichter et al.
+
+    Level 1 model: Table VIII polynomial-fit transverse responses, gAs=0, and
+    delta0=delta00=0. This is the default because it is fast and uses the
+    literature-backed shell-model response without the extra correction inputs.
+    """
+
+    structures: Hoferichter19FTransverseStructureFunctions = field(
+        default_factory=Hoferichter19FTransverseStructureFunctions
+    )
+    gA: float = HOFERICHTER_G_A
+    gAs: float = HOFERICHTER_G_A_STRANGE_FAST
+
+    def __post_init__(self) -> None:
+        self._check_positive_normalization("fast")
+
+    def __call__(self, q2_gev2: float) -> float:
+        value = GenericAxialFormFactor(J=0.5, structures=self.structures, gA=self.gA, gAs=self.gAs)(q2_gev2)
+        # Physical q2 values should give a finite positive default 19F axial response.
+        if not math.isfinite(value):
+            raise ValueError("Hoferichter fast 19F axial form factor is not finite.")
+        return value
+
+    def _check_positive_normalization(self, label: str) -> None:
+        for q2_gev2 in (0.0, 0.01):
+            value = GenericAxialFormFactor(J=0.5, structures=self.structures, gA=self.gA, gAs=self.gAs)(q2_gev2)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"Hoferichter {label} 19F axial form factor must be finite and positive.")
+
+
+@dataclass(frozen=True)
+class Hoferichter19FCentralAxial(Hoferichter19FFastAxial):
+    """Detailed central 19F axial form factor from Hoferichter et al.
+
+    Level 2 model: the same Table VIII 19F polynomial-fit transverse responses,
+    Table I gA/gAs/axial-radius central inputs, Table V rho/c_i/cD central
+    inputs, and Eq. (86) delta0(q^2), delta00(q^2) corrections.
+    """
+
+    structures: Hoferichter19FTransverseStructureFunctions = field(
+        default_factory=lambda: Hoferichter19FTransverseStructureFunctions(
+            corrections=HoferichterCentralDeltaCorrections()
+        )
+    )
+    gA: float = HOFERICHTER_G_A
+    gAs: float = HOFERICHTER_G_A_STRANGE_CENTRAL
+
+    def __post_init__(self) -> None:
+        self._check_positive_normalization("central")
+
+    def __call__(self, q2_gev2: float) -> float:
+        value = GenericAxialFormFactor(J=0.5, structures=self.structures, gA=self.gA, gAs=self.gAs)(q2_gev2)
+        if not math.isfinite(value):
+            raise ValueError("Hoferichter central 19F axial form factor is not finite.")
+        return value
+
+
+Hoferichter19FTabulatedAxial = Hoferichter19FFastAxial
+
+
+@dataclass(frozen=True)
+class SpinExpectationAxialToyModel:
+    """Toy/debug axial model, not a default physics model.
+
+    This deliberately simple model keeps a zero-momentum spin-expectation
+    normalization and multiplies it by a phenomenological dipole-like falloff.
+    It is retained only for debugging/benchmarking and is not a literature-grade
+    19F CEvNS nuclear-response model.
 
     FA(0) ≈ gA^2 * (32π/3) * (J+1)/(J(2J+1)) * (Sp - Sn)^2
-    FA(q^2) = FA(0) * f(q^2)
-
-    with f(q^2) = (1 + q^2 / Lambda_A^2)^(-2 * power)
+    FA(q^2) = FA(0) * (1 + q^2 / Lambda_A^2)^(-exponent)
     """
 
     J: float
@@ -211,15 +537,18 @@ class SpinExpectationAxialApprox:
     Sn: float
     gA: float = G_A_NUCLEON
     lambda_a_gev: float = 0.35
-    power: float = 2.0
+    exponent: float = 2.0
 
     def __call__(self, q2_gev2: float) -> float:
         if self.J <= 0.0:
             return 0.0
         delta_s = self.Sp - self.Sn
         fa0 = (self.gA ** 2) * (32.0 * math.pi / 3.0) * ((self.J + 1.0) / (self.J * (2.0 * self.J + 1.0))) * (delta_s ** 2)
-        shape = (1.0 + q2_gev2 / (self.lambda_a_gev ** 2)) ** (-self.power)
+        shape = (1.0 + q2_gev2 / (self.lambda_a_gev ** 2)) ** (-self.exponent)
         return fa0 * shape
+
+
+SpinExpectationAxialApprox = SpinExpectationAxialToyModel
 
 
 @dataclass(frozen=True)
@@ -524,29 +853,116 @@ def carbon12_target(*, use_helm: bool = True) -> NuclearTarget:
 def fluorine19_target(
     *,
     use_helm: bool = True,
-    axial_model: str = "approx",
+    axial_model: str = "hoferichter_19f_fast",
     Sp: float = 0.475,
     Sn: float = -0.009,
     lambda_a_gev: float = 0.35,
+    axial_form_factor: Optional[Callable[[float], float]] = None,
 ) -> NuclearTarget:
     ff: VectorFormFactor = HelmFormFactor(A=19) if use_helm else UnityFormFactor()
+    requested_axial_model = axial_model
+    axial_model_key = axial_model.strip().lower().replace("-", "_")
 
-    if axial_model == "none":
+    if axial_model_key == "none":
         axial = ZeroAxialFormFactor()
+        axial_model = "none"
         note = "Axial term disabled by request."
-    elif axial_model == "approx":
-        axial = SpinExpectationAxialApprox(
+    elif axial_model_key in {"hoferichter_19f_fast", "hoferichter_19f", "hoferichter19f", "hms_19f"}:
+        axial = Hoferichter19FFastAxial()
+        axial_model = "hoferichter_19f_fast"
+        note = (
+            "Fast literature-backed 19F axial model using Hoferichter, Menendez, "
+            "Schwenk Appendix E Table VIII transverse shell-model polynomial fits; "
+            "gAs=0 and delta0/delta00 are set to zero."
+        )
+    elif axial_model_key in {"hoferichter_19f_central", "central", "hms_19f_central"}:
+        axial = Hoferichter19FCentralAxial()
+        axial_model = "hoferichter_19f_central"
+        note = (
+            "Central Hoferichter 19F axial model using Table VIII polynomial fits, "
+            "Table I gA/gAs/axial-radius inputs, Table V rho/c_i/cD inputs, and "
+            "Eq. (86) delta0/delta00 corrections."
+        )
+    elif axial_model_key == "approx":
+        axial = Hoferichter19FFastAxial()
+        axial_model = "hoferichter_19f_fast"
+        note = (
+            "Legacy axial_model='approx' request mapped to hoferichter_19f_fast. "
+            "Use axial_model='toy' only for the old simplified debug/testing model."
+        )
+    elif axial_model_key in {"toy", "toy_constant_fa0"}:
+        axial = SpinExpectationAxialToyModel(
             J=0.5,
             Sp=Sp,
             Sn=Sn,
             lambda_a_gev=lambda_a_gev,
         )
+        axial_model = "toy"
         note = (
-            "Approximate axial model from zero-momentum spin expectation values; "
-            "replace with shell-model S_ij(q^2) for final studies."
+            "Toy/debug axial model based on zero-momentum spin expectation values "
+            "with dipole-like suppression; not a literature-grade 19F CEvNS "
+            "nuclear-response model."
+        )
+    elif axial_model_key == "tabulated":
+        if axial_form_factor is None:
+            raise ValueError("axial_model='tabulated' requires axial_form_factor.")
+        axial = axial_form_factor
+        axial_model = "tabulated"
+        note = (
+            "User-supplied axial form factor; use GenericAxialFormFactor with "
+            "tabulated S_ij(q^2) for exact 19F structure inputs."
         )
     else:
-        raise ValueError(f"Unknown axial_model={axial_model!r}. Supported: 'approx', 'none'.")
+        raise ValueError(
+            f"Unknown axial_model={requested_axial_model!r}. Supported: "
+            "'hoferichter_19f_fast', 'hoferichter_19f_central', 'none', 'toy', "
+            "'tabulated'. Legacy aliases: 'hoferichter_19f' and 'approx' map to "
+            "'hoferichter_19f_fast'."
+        )
+
+    metadata: Dict[str, float | str] = {
+        "axial_model": axial_model,
+        "requested_axial_model": requested_axial_model,
+        "note": note,
+    }
+    if axial_model in {"hoferichter_19f_fast", "hoferichter_19f_central"}:
+        metadata.update({
+            "reference": "Hoferichter, Menendez, Schwenk, PRD 102 (2020), arXiv:2007.08529",
+            "coefficient_table": "Appendix E, Table VIII",
+            "response_type": "transverse shell-model polynomial fits F^{Sigma_0} / F^{Sigma_{00}}, L=1",
+            "b_fm": axial.structures.b_fm,
+            "J": 0.5,
+            "gA": axial.gA,
+            "gAs": axial.gAs,
+        })
+    if axial_model == "hoferichter_19f_fast":
+        metadata["delta_corrections"] = "delta0=0, delta00=0"
+        if axial_model_key == "approx":
+            metadata["warning"] = "Legacy 'approx' now maps to 'hoferichter_19f_fast'; use 'toy' for the old debug model."
+    if axial_model == "hoferichter_19f_central":
+        corrections = axial.structures.corrections
+        if isinstance(corrections, HoferichterCentralDeltaCorrections):
+            metadata.update({
+                "delta_corrections": "delta0(q^2), delta00(q^2) included from Eq. (86)",
+                "rho_fm3": corrections.rho_fm3,
+                "c1_gev_inv": corrections.c1_gev_inv,
+                "c3_gev_inv": corrections.c3_gev_inv,
+                "c4_gev_inv": corrections.c4_gev_inv,
+                "c6_gev_inv": corrections.c6_gev_inv,
+                "cD": corrections.cD,
+                "axial_radius_sq_fm2": corrections.axial_radius_sq_fm2,
+                "f_pi_gev": corrections.f_pi_gev,
+                "m_pi_gev": corrections.m_pi_gev,
+                "g_pi_nn": corrections.g_pi_nn,
+            })
+    if axial_model == "toy":
+        metadata.update({
+            "Sp": Sp,
+            "Sn": Sn,
+            "lambda_a_gev": lambda_a_gev,
+            "axial_exponent": axial.exponent,
+            "warning": "Toy/debug only; not proposal-grade 19F axial physics.",
+        })
 
     return NuclearTarget(
         name="19F",
@@ -556,12 +972,7 @@ def fluorine19_target(
         J=0.5,
         vector_form_factor=ff,
         axial_form_factor=axial,
-        metadata={
-            "Sp": Sp,
-            "Sn": Sn,
-            "axial_model": axial_model,
-            "note": note,
-        },
+        metadata=metadata,
     )
 
 
@@ -668,10 +1079,15 @@ def main() -> None:
     parser.add_argument("--enu-mev", type=float, required=True, help="Neutrino energy in MeV")
     parser.add_argument("--er-kev", type=float, required=True, help="Nuclear recoil energy in keV")
     parser.add_argument("--pointlike", action="store_true", help="Use F(q^2)=1 instead of Helm form factor")
-    parser.add_argument("--axial-model", default="approx", choices=["approx", "none"], help="Axial model for 19F")
-    parser.add_argument("--sp", type=float, default=0.475, help="<S_p> for the approximate 19F axial model")
-    parser.add_argument("--sn", type=float, default=-0.009, help="<S_n> for the approximate 19F axial model")
-    parser.add_argument("--lambda-a-gev", type=float, default=0.35, help="Axial dipole scale in GeV for approximate 19F axial model")
+    parser.add_argument(
+        "--axial-model",
+        default="hoferichter_19f_fast",
+        choices=["hoferichter_19f_fast", "hoferichter_19f_central", "none", "toy"],
+        help="Axial model for 19F: fast Hoferichter polynomial fit, central Hoferichter corrections, none, or toy/debug",
+    )
+    parser.add_argument("--sp", type=float, default=0.475, help="<S_p> for the toy/debug 19F axial model")
+    parser.add_argument("--sn", type=float, default=-0.009, help="<S_n> for the toy/debug 19F axial model")
+    parser.add_argument("--lambda-a-gev", type=float, default=0.35, help="Axial dipole scale in GeV for toy/debug 19F axial model")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     args = parser.parse_args()
 

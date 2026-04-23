@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import os
+import sys
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -73,6 +75,94 @@ OUTPUT_DIR = "cevens_rate_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+class ProgressReporter:
+    """Small stderr progress reporter for long scans; numerical logic is unchanged."""
+
+    def __init__(
+        self,
+        label: Optional[str],
+        total: int,
+        *,
+        min_interval_s: float = 2.0,
+        n_updates: int = 50,
+    ) -> None:
+        self.label = label or ""
+        self.total = max(0, int(total))
+        self.enabled = bool(self.label) and self.total > 0
+        self.min_interval_s = float(min_interval_s)
+        self.update_step = max(1, self.total // max(1, int(n_updates)))
+        self.start_time = time.monotonic()
+        self.last_emit_time = self.start_time
+        self.last_emit_completed = 0
+        self.finished = False
+        self.use_carriage_return = sys.stderr.isatty()
+
+        if self.enabled:
+            self._emit(0, final=False)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        if seconds < 60.0:
+            return f"{seconds:.0f}s"
+        minutes, sec = divmod(int(round(seconds)), 60)
+        if minutes < 60:
+            return f"{minutes:d}m{sec:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:d}h{minutes:02d}m{sec:02d}s"
+
+    def _emit(self, completed: int, *, final: bool) -> None:
+        now = time.monotonic()
+        elapsed = now - self.start_time
+        rate = completed / elapsed if elapsed > 0.0 else 0.0
+        eta_text = (
+            self._format_duration((self.total - completed) / rate)
+            if rate > 0.0
+            else "--"
+        )
+        pct = 100.0 * completed / self.total if self.total else 100.0
+
+        line = (
+            f"[{self.label}] {pct:6.2f}% "
+            f"({completed}/{self.total}) "
+            f"elapsed {self._format_duration(elapsed)} "
+            f"ETA {eta_text} "
+            f"rate {rate:.2f} grid-points/s"
+        )
+        if final:
+            line += " done"
+
+        if self.use_carriage_return:
+            print("\r" + line, end="\n" if final else "", file=sys.stderr, flush=True)
+        else:
+            print(line, file=sys.stderr, flush=True)
+
+        self.last_emit_time = now
+        self.last_emit_completed = completed
+
+    def update(self, completed: int) -> None:
+        if not self.enabled or self.finished:
+            return
+
+        completed = min(max(0, int(completed)), self.total)
+        now = time.monotonic()
+        final = completed >= self.total
+        should_emit = (
+            final
+            or completed == 1
+            or completed - self.last_emit_completed >= self.update_step
+            or now - self.last_emit_time >= self.min_interval_s
+        )
+        if not should_emit:
+            return
+
+        self._emit(completed, final=final)
+        self.finished = final
+
+    def done(self) -> None:
+        self.update(self.total)
+
+
 @dataclass
 class RateConfig:
     distance_m: float = 20.0
@@ -95,8 +185,9 @@ class RateConfig:
     # optional threshold for integrated-above-threshold summaries
     threshold_kev: float = 0.0
 
-    # built-in 19F axial approx settings
-    fluorine_axial_model: str = "approx"
+    # 19F axial model used by the CF4 rate scan.
+    # Options: "hoferichter_19f_fast", "hoferichter_19f_central", "none", "toy".
+    fluorine_axial_model: str = "hoferichter_19f_central"
     fluorine_sp: float = 0.475
     fluorine_sn: float = -0.009
     fluorine_lambda_a_gev: float = 0.35
@@ -163,6 +254,7 @@ def compute_component_rates_per_target(
     enu_grid_mev: np.ndarray,
     beam: ESSBeamConfig,
     distance_m: float,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Per-target rates:
@@ -186,6 +278,8 @@ def compute_component_rates_per_target(
     rate_numubar_total = np.zeros(n_er)
     rate_numubar_vector = np.zeros(n_er)
     rate_numubar_axial = np.zeros(n_er)
+
+    progress = ProgressReporter(progress_label, n_er)
 
     for i, er in enumerate(er_grid_kev):
         # Prompt monochromatic nu_mu line
@@ -222,6 +316,10 @@ def compute_component_rates_per_target(
         rate_numubar_vector[i] = integrate_over_enu(enu_grid_mev, phi_numubar, ds_numubar_vector)
         rate_numubar_axial[i] = integrate_over_enu(enu_grid_mev, phi_numubar, ds_numubar_axial)
 
+        progress.update(i + 1)
+
+    progress.done()
+
     out = {
         "prompt_total": rate_prompt_total,
         "prompt_vector": rate_prompt_vector,
@@ -251,6 +349,7 @@ def compute_electron_scattering_rates(
     enu_grid_mev: np.ndarray,
     beam: ESSBeamConfig,
     distance_m: float,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Electron-scattering rates:
@@ -268,6 +367,8 @@ def compute_electron_scattering_rates(
     nue_per_electron = np.zeros(n_te)
     numubar_per_electron = np.zeros(n_te)
 
+    progress = ProgressReporter(progress_label, n_te)
+
     for i, te in enumerate(te_grid_kev):
         ds_prompt = calc.differential_cross_section_cm2_per_kev("numu", E_NU_MU_PROMPT_MEV, te)
         prompt_per_electron[i] = phi_prompt_line * ds_prompt
@@ -277,6 +378,10 @@ def compute_electron_scattering_rates(
 
         nue_per_electron[i] = integrate_over_enu(enu_grid_mev, phi_nue, ds_nue)
         numubar_per_electron[i] = integrate_over_enu(enu_grid_mev, phi_numubar, ds_numubar)
+
+        progress.update(i + 1)
+
+    progress.done()
 
     delayed_per_electron = nue_per_electron + numubar_per_electron
     total_per_electron = prompt_per_electron + delayed_per_electron
@@ -681,6 +786,7 @@ def main() -> None:
         enu_grid_mev=enu_grid_mev,
         beam=beam,
         distance_m=cfg.distance_m,
+        progress_label="CEvNS 12C recoil grid",
     )
 
     rates_f = compute_component_rates_per_target(
@@ -690,6 +796,7 @@ def main() -> None:
         enu_grid_mev=enu_grid_mev,
         beam=beam,
         distance_m=cfg.distance_m,
+        progress_label="CEvNS 19F recoil grid",
     )
 
     electron_rates = compute_electron_scattering_rates(
@@ -698,6 +805,7 @@ def main() -> None:
         enu_grid_mev=enu_grid_mev,
         beam=beam,
         distance_m=cfg.distance_m,
+        progress_label="nu-e CF4 electron grid",
     )
 
     csv_file = os.path.join(OUTPUT_DIR, "cf4_differential_rate_per_molecule.csv")
