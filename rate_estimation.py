@@ -10,6 +10,9 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 
+import ESS_flux
+import JPARK_flux
+import SNS_flux
 from cevens import (
     CEvNSCalculator,
     NeutrinoElectronCalculator,
@@ -17,16 +20,9 @@ from cevens import (
     carbon12_target,
     fluorine19_target,
 )
-from ESS_flux import (
-    ESSBeamConfig,
-    E_NU_MU_PROMPT_MEV,
-    E_NU_MAX_MEV,
-    differential_flux_delayed,
-    prompt_numu_line_flux,
-)
 
 # ============================================================
-# CF4 differential-rate scan at an ESS-like pion-DAR source
+# CF4 differential-rate scan at a benchmark pion-DAR source
 #
 # What this script computes
 # -------------------------
@@ -71,8 +67,67 @@ from ESS_flux import (
 #   dR/dEr      : s^-1 keV^-1 molecule^-1
 # ============================================================
 
-OUTPUT_DIR = "cevens_rate_output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+@dataclass(frozen=True)
+class DARSourceModel:
+    key: str
+    label: str
+    beam_factory: object
+    prompt_energy_mev: float
+    delayed_endpoint_mev: float
+    differential_flux_delayed: object
+    prompt_numu_line_flux: object
+    default_output_dir: str
+
+
+SOURCE_MODELS: Dict[str, DARSourceModel] = {
+    "ess": DARSourceModel(
+        key="ess",
+        label="ESS",
+        beam_factory=ESS_flux.ESSBeamConfig,
+        prompt_energy_mev=ESS_flux.E_NU_MU_PROMPT_MEV,
+        delayed_endpoint_mev=ESS_flux.E_NU_MAX_MEV,
+        differential_flux_delayed=ESS_flux.differential_flux_delayed,
+        prompt_numu_line_flux=ESS_flux.prompt_numu_line_flux,
+        default_output_dir="cevens_rate_output",
+    ),
+    "sns": DARSourceModel(
+        key="sns",
+        label="SNS FTS",
+        beam_factory=SNS_flux.SNSBeamConfig,
+        prompt_energy_mev=SNS_flux.E_NU_MU_PROMPT_MEV,
+        delayed_endpoint_mev=SNS_flux.E_NU_MAX_MEV,
+        differential_flux_delayed=SNS_flux.differential_flux_delayed,
+        prompt_numu_line_flux=SNS_flux.prompt_numu_line_flux,
+        default_output_dir="cevens_rate_output_sns",
+    ),
+    "jparc": DARSourceModel(
+        key="jparc",
+        label="J-PARC MLF",
+        beam_factory=JPARK_flux.JPARCMLFBeamConfig,
+        prompt_energy_mev=JPARK_flux.E_NU_MU_PROMPT_MEV,
+        delayed_endpoint_mev=JPARK_flux.E_NU_MAX_MEV,
+        differential_flux_delayed=JPARK_flux.differential_flux_delayed,
+        prompt_numu_line_flux=JPARK_flux.prompt_numu_line_flux,
+        default_output_dir="cevens_rate_output_jparc",
+    ),
+}
+
+
+def get_source_model(source_model: str) -> DARSourceModel:
+    key = source_model.strip().lower().replace("-", "_")
+    aliases = {
+        "ess": "ess",
+        "sns": "sns",
+        "jparc": "jparc",
+        "j_parc": "jparc",
+        "jparc_mlf": "jparc",
+        "mlf": "jparc",
+    }
+    normalized = aliases.get(key)
+    if normalized is None:
+        raise ValueError("source_model must be one of: 'ess', 'sns', 'jparc'")
+    return SOURCE_MODELS[normalized]
 
 
 class ProgressReporter:
@@ -165,7 +220,11 @@ class ProgressReporter:
 
 @dataclass
 class RateConfig:
+    # DAR source model used in the flux folding.
+    # Options: "ess", "sns", "jparc".
+    source_model: str = "ess"
     distance_m: float = 20.0
+    output_dir: Optional[str] = None
 
     # nuclear recoil-energy grid for CEvNS
     er_min_kev: float = 0.0
@@ -179,7 +238,7 @@ class RateConfig:
 
     # neutrino-energy grid for delayed components
     enu_min_mev: float = 1E-6
-    enu_max_mev: float = E_NU_MAX_MEV
+    enu_max_mev: Optional[float] = None
     n_enu: int = 3000
 
     # optional threshold for integrated-above-threshold summaries
@@ -252,7 +311,8 @@ def compute_component_rates_per_target(
     target,
     er_grid_kev: np.ndarray,
     enu_grid_mev: np.ndarray,
-    beam: ESSBeamConfig,
+    source: DARSourceModel,
+    beam,
     distance_m: float,
     progress_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
@@ -261,9 +321,9 @@ def compute_component_rates_per_target(
         dR/dEr [s^-1 keV^-1 target^-1]
     with prompt and delayed components split.
     """
-    phi_prompt_line = prompt_numu_line_flux(distance_m, beam=beam)  # cm^-2 s^-1
-    phi_nue = differential_flux_delayed(enu_grid_mev, distance_m, "nue", beam=beam)
-    phi_numubar = differential_flux_delayed(enu_grid_mev, distance_m, "numubar", beam=beam)
+    phi_prompt_line = source.prompt_numu_line_flux(distance_m, beam=beam)  # cm^-2 s^-1
+    phi_nue = source.differential_flux_delayed(enu_grid_mev, distance_m, "nue", beam=beam)
+    phi_numubar = source.differential_flux_delayed(enu_grid_mev, distance_m, "numubar", beam=beam)
 
     n_er = len(er_grid_kev)
 
@@ -284,13 +344,13 @@ def compute_component_rates_per_target(
     for i, er in enumerate(er_grid_kev):
         # Prompt monochromatic nu_mu line
         ds_prompt_total = calc.differential_cross_section_cm2_per_kev(
-            target, E_NU_MU_PROMPT_MEV, er
+            target, source.prompt_energy_mev, er
         )
         ds_prompt_vector = calc.differential_vector_cross_section_cm2_per_kev(
-            target, E_NU_MU_PROMPT_MEV, er
+            target, source.prompt_energy_mev, er
         )
         ds_prompt_axial = calc.differential_axial_cross_section_cm2_per_kev(
-            target, E_NU_MU_PROMPT_MEV, er
+            target, source.prompt_energy_mev, er
         )
 
         rate_prompt_total[i] = phi_prompt_line * ds_prompt_total
@@ -347,7 +407,8 @@ def compute_electron_scattering_rates(
     calc: NeutrinoElectronCalculator,
     te_grid_kev: np.ndarray,
     enu_grid_mev: np.ndarray,
-    beam: ESSBeamConfig,
+    source: DARSourceModel,
+    beam,
     distance_m: float,
     progress_label: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
@@ -358,9 +419,9 @@ def compute_electron_scattering_rates(
     Returns both per-electron and per-molecule rates. The molecule-level
     rates include all target electrons in the configured electron target.
     """
-    phi_prompt_line = prompt_numu_line_flux(distance_m, beam=beam)  # cm^-2 s^-1
-    phi_nue = differential_flux_delayed(enu_grid_mev, distance_m, "nue", beam=beam)
-    phi_numubar = differential_flux_delayed(enu_grid_mev, distance_m, "numubar", beam=beam)
+    phi_prompt_line = source.prompt_numu_line_flux(distance_m, beam=beam)  # cm^-2 s^-1
+    phi_nue = source.differential_flux_delayed(enu_grid_mev, distance_m, "nue", beam=beam)
+    phi_numubar = source.differential_flux_delayed(enu_grid_mev, distance_m, "numubar", beam=beam)
 
     n_te = len(te_grid_kev)
     prompt_per_electron = np.zeros(n_te)
@@ -370,7 +431,7 @@ def compute_electron_scattering_rates(
     progress = ProgressReporter(progress_label, n_te)
 
     for i, te in enumerate(te_grid_kev):
-        ds_prompt = calc.differential_cross_section_cm2_per_kev("numu", E_NU_MU_PROMPT_MEV, te)
+        ds_prompt = calc.differential_cross_section_cm2_per_kev("numu", source.prompt_energy_mev, te)
         prompt_per_electron[i] = phi_prompt_line * ds_prompt
 
         ds_nue = build_dsigma_electron_vs_enu(calc, "nue", enu_grid_mev, te)
@@ -566,6 +627,7 @@ def plot_cf4_rates(
     er_grid_kev: np.ndarray,
     rates_c: Dict[str, np.ndarray],
     rates_f: Dict[str, np.ndarray],
+    source_label: str,
 ) -> None:
     c_mult = 1.0
     f_mult = 4.0
@@ -585,7 +647,7 @@ def plot_cf4_rates(
     plt.yscale("log")
     plt.xlabel("Recoil energy [keV]")
     plt.ylabel(r"$dR/dE_r$ [s$^{-1}$ keV$^{-1}$ molecule$^{-1}$]")
-    plt.title("CF4 differential CEvNS rate at ESS-like pion-DAR source")
+    plt.title(f"CF4 differential CEvNS rate at {source_label} pion-DAR source")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -597,6 +659,7 @@ def plot_cf4_electron_rates(
     filename: str,
     te_grid_kev: np.ndarray,
     electron_rates: Dict[str, np.ndarray],
+    source_label: str,
 ) -> None:
     plt.figure(figsize=(8, 5))
     plt.plot(te_grid_kev, electron_rates["prompt_per_molecule"], label=r"prompt $\nu_\mu e$")
@@ -607,7 +670,7 @@ def plot_cf4_electron_rates(
     plt.yscale("log")
     plt.xlabel("Electron recoil energy [keV]")
     plt.ylabel(r"$dR/dT_e$ [s$^{-1}$ keV$^{-1}$ molecule$^{-1}$]")
-    plt.title(r"CF4 differential $\nu$-e rate at ESS-like pion-DAR source")
+    plt.title(rf"CF4 differential $\nu$-e rate at {source_label} pion-DAR source")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -620,6 +683,7 @@ def plot_cf4_composition(
     er_grid_kev: np.ndarray,
     rates_c: Dict[str, np.ndarray],
     rates_f: Dict[str, np.ndarray],
+    source_label: str,
 ) -> None:
     cf4_c_piece = rates_c["total"]
     cf4_4f_piece = 4.0 * rates_f["total"]
@@ -632,7 +696,7 @@ def plot_cf4_composition(
     plt.yscale("log")
     plt.xlabel("Recoil energy [keV]")
     plt.ylabel(r"$dR/dE_r$ [s$^{-1}$ keV$^{-1}$ molecule$^{-1}$]")
-    plt.title("CF4 composition of the CEvNS recoil spectrum")
+    plt.title(f"CF4 composition of the CEvNS recoil spectrum at {source_label}")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -644,6 +708,7 @@ def plot_fluorine_axial_fraction(
     filename: str,
     er_grid_kev: np.ndarray,
     rates_f: Dict[str, np.ndarray],
+    source_label: str,
 ) -> None:
     frac = np.zeros_like(er_grid_kev)
     mask = rates_f["total"] > 0.0
@@ -653,7 +718,7 @@ def plot_fluorine_axial_fraction(
     plt.plot(er_grid_kev, frac)
     plt.xlabel("Recoil energy [keV]")
     plt.ylabel("Axial fraction in 19F total rate")
-    plt.title("19F axial fraction in the flux-folded CEvNS rate")
+    plt.title(f"19F axial fraction in the flux-folded CEvNS rate at {source_label}")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(filename, dpi=200)
@@ -662,7 +727,8 @@ def plot_fluorine_axial_fraction(
 
 def print_summary(
     cfg: RateConfig,
-    beam: ESSBeamConfig,
+    source: DARSourceModel,
+    beam,
     carbon,
     fluorine,
     electron_target,
@@ -672,6 +738,8 @@ def print_summary(
     er_grid_kev: np.ndarray,
     te_grid_kev: np.ndarray,
 ) -> None:
+    effective_enu_max_mev = cfg.enu_max_mev if cfg.enu_max_mev is not None else source.delayed_endpoint_mev
+
     cf4_prompt = rates_c["prompt_total"] + 4.0 * rates_f["prompt_total"]
     cf4_nue = rates_c["nue_total"] + 4.0 * rates_f["nue_total"]
     cf4_numubar = rates_c["numubar_total"] + 4.0 * rates_f["numubar_total"]
@@ -704,22 +772,23 @@ def print_summary(
     )
 
     print("=== Configuration ===")
+    print(f"Source model                    : {source.label} ({source.key})")
     print(f"Distance to source              : {cfg.distance_m:.3f} m")
-    print(f"Prompt neutrino energy          : {E_NU_MU_PROMPT_MEV:.6f} MeV")
-    print(f"Delayed endpoint                : {E_NU_MAX_MEV:.6f} MeV")
+    print(f"Prompt neutrino energy          : {source.prompt_energy_mev:.6f} MeV")
+    print(f"Delayed endpoint                : {source.delayed_endpoint_mev:.6f} MeV")
     print(f"Nuclear recoil grid             : {cfg.er_min_kev:.3f} -> {cfg.er_max_kev:.3f} keV ({cfg.n_er} bins)")
     print(f"Electron recoil grid            : {cfg.te_min_kev:.3f} -> {cfg.te_max_kev:.3f} keV ({cfg.n_te} bins)")
-    print(f"Delayed E_nu grid               : {cfg.enu_min_mev:.3f} -> {cfg.enu_max_mev:.3f} MeV ({cfg.n_enu} bins)")
+    print(f"Delayed E_nu grid               : {cfg.enu_min_mev:.3f} -> {effective_enu_max_mev:.3f} MeV ({cfg.n_enu} bins)")
     print(f"Threshold for summary integral  : {cfg.threshold_kev:.3f} keV")
     print()
 
     print("=== Target kinematic endpoints ===")
-    print(f"12C: Er_max(prompt)             : {carbon.max_recoil_kev(E_NU_MU_PROMPT_MEV):.6f} keV")
-    print(f"12C: Er_max(delayed endpoint)   : {carbon.max_recoil_kev(E_NU_MAX_MEV):.6f} keV")
-    print(f"19F: Er_max(prompt)             : {fluorine.max_recoil_kev(E_NU_MU_PROMPT_MEV):.6f} keV")
-    print(f"19F: Er_max(delayed endpoint)   : {fluorine.max_recoil_kev(E_NU_MAX_MEV):.6f} keV")
-    print(f"e- : Te_max(prompt)             : {electron_target.max_recoil_kev(E_NU_MU_PROMPT_MEV):.6f} keV")
-    print(f"e- : Te_max(delayed endpoint)   : {electron_target.max_recoil_kev(E_NU_MAX_MEV):.6f} keV")
+    print(f"12C: Er_max(prompt)             : {carbon.max_recoil_kev(source.prompt_energy_mev):.6f} keV")
+    print(f"12C: Er_max(delayed endpoint)   : {carbon.max_recoil_kev(source.delayed_endpoint_mev):.6f} keV")
+    print(f"19F: Er_max(prompt)             : {fluorine.max_recoil_kev(source.prompt_energy_mev):.6f} keV")
+    print(f"19F: Er_max(delayed endpoint)   : {fluorine.max_recoil_kev(source.delayed_endpoint_mev):.6f} keV")
+    print(f"e- : Te_max(prompt)             : {electron_target.max_recoil_kev(source.prompt_energy_mev):.6f} keV")
+    print(f"e- : Te_max(delayed endpoint)   : {electron_target.max_recoil_kev(source.delayed_endpoint_mev):.6f} keV")
     print()
 
     print("=== CF4 molecule integrated CEvNS rates ===")
@@ -758,11 +827,16 @@ def print_summary(
     print(f"Neutrinos/year/flavor           : {beam.neutrinos_per_year_per_flavor:.6e}")
     print(f"Duty factor                     : {beam.duty_factor:.6e}")
     print(f"Protons/pulse                   : {beam.protons_per_pulse:.6e}")
+    if hasattr(beam, "yield_fractional_uncertainty"):
+        print(f"Yield fractional uncertainty    : {beam.yield_fractional_uncertainty:.3%}")
 
 
 def main() -> None:
     cfg = RateConfig()
-    beam = ESSBeamConfig()
+    source = get_source_model(cfg.source_model)
+    beam = source.beam_factory()
+    output_dir = cfg.output_dir or source.default_output_dir
+    os.makedirs(output_dir, exist_ok=True)
     calc = CEvNSCalculator()
     electron_target = cf4_electron_target()
     electron_calc = NeutrinoElectronCalculator(electron_target=electron_target)
@@ -777,16 +851,18 @@ def main() -> None:
 
     er_grid_kev = np.linspace(cfg.er_min_kev, cfg.er_max_kev, cfg.n_er)
     te_grid_kev = np.linspace(cfg.te_min_kev, cfg.te_max_kev, cfg.n_te)
-    enu_grid_mev = np.linspace(cfg.enu_min_mev, cfg.enu_max_mev, cfg.n_enu)
+    enu_max_mev = cfg.enu_max_mev if cfg.enu_max_mev is not None else source.delayed_endpoint_mev
+    enu_grid_mev = np.linspace(cfg.enu_min_mev, enu_max_mev, cfg.n_enu)
 
     rates_c = compute_component_rates_per_target(
         calc=calc,
         target=carbon,
         er_grid_kev=er_grid_kev,
         enu_grid_mev=enu_grid_mev,
+        source=source,
         beam=beam,
         distance_m=cfg.distance_m,
-        progress_label="CEvNS 12C recoil grid",
+        progress_label=f"{source.label} CEvNS 12C recoil grid",
     )
 
     rates_f = compute_component_rates_per_target(
@@ -794,36 +870,39 @@ def main() -> None:
         target=fluorine,
         er_grid_kev=er_grid_kev,
         enu_grid_mev=enu_grid_mev,
+        source=source,
         beam=beam,
         distance_m=cfg.distance_m,
-        progress_label="CEvNS 19F recoil grid",
+        progress_label=f"{source.label} CEvNS 19F recoil grid",
     )
 
     electron_rates = compute_electron_scattering_rates(
         calc=electron_calc,
         te_grid_kev=te_grid_kev,
         enu_grid_mev=enu_grid_mev,
+        source=source,
         beam=beam,
         distance_m=cfg.distance_m,
-        progress_label="nu-e CF4 electron grid",
+        progress_label=f"{source.label} nu-e CF4 electron grid",
     )
 
-    csv_file = os.path.join(OUTPUT_DIR, "cf4_differential_rate_per_molecule.csv")
-    electron_csv_file = os.path.join(OUTPUT_DIR, "cf4_electron_differential_rate_per_molecule.csv")
-    fig_rate = os.path.join(OUTPUT_DIR, "cf4_differential_rate_components.png")
-    fig_electron_rate = os.path.join(OUTPUT_DIR, "cf4_electron_differential_rate_components.png")
-    fig_comp = os.path.join(OUTPUT_DIR, "cf4_composition_c_vs_4f.png")
-    fig_ax = os.path.join(OUTPUT_DIR, "fluorine_axial_fraction_flux_folded.png")
+    csv_file = os.path.join(output_dir, "cf4_differential_rate_per_molecule.csv")
+    electron_csv_file = os.path.join(output_dir, "cf4_electron_differential_rate_per_molecule.csv")
+    fig_rate = os.path.join(output_dir, "cf4_differential_rate_components.png")
+    fig_electron_rate = os.path.join(output_dir, "cf4_electron_differential_rate_components.png")
+    fig_comp = os.path.join(output_dir, "cf4_composition_c_vs_4f.png")
+    fig_ax = os.path.join(output_dir, "fluorine_axial_fraction_flux_folded.png")
 
     write_csv(csv_file, er_grid_kev, rates_c, rates_f)
     write_electron_csv(electron_csv_file, te_grid_kev, electron_rates)
-    plot_cf4_rates(fig_rate, er_grid_kev, rates_c, rates_f)
-    plot_cf4_electron_rates(fig_electron_rate, te_grid_kev, electron_rates)
-    plot_cf4_composition(fig_comp, er_grid_kev, rates_c, rates_f)
-    plot_fluorine_axial_fraction(fig_ax, er_grid_kev, rates_f)
+    plot_cf4_rates(fig_rate, er_grid_kev, rates_c, rates_f, source.label)
+    plot_cf4_electron_rates(fig_electron_rate, te_grid_kev, electron_rates, source.label)
+    plot_cf4_composition(fig_comp, er_grid_kev, rates_c, rates_f, source.label)
+    plot_fluorine_axial_fraction(fig_ax, er_grid_kev, rates_f, source.label)
 
     print_summary(
         cfg,
+        source,
         beam,
         carbon,
         fluorine,

@@ -1,37 +1,44 @@
-import numpy as np
+from __future__ import annotations
+
 import csv
-import matplotlib.pyplot as plt
 import os
 
+import matplotlib.pyplot as plt
+import numpy as np
+
 # ============================================================
-# J-PARC MLF pion-DAR neutrino flux model
+# J-PARC MLF pion-DAR benchmark flux model
 #
-# Benchmark point:
-#   proton beam power   P = 1 MW
-#   proton kinetic E    Ep = 3 GeV
-#   repetition rate     f = 25 Hz
-#   bunch structure     2 bunches / spill
-#   yield benchmark     y = 0.48 neutrinos / proton / flavor
+# This module is a lightweight semi-analytic stopped-pion DAR source model.
+# It exposes:
+#   - average delayed differential fluxes          [cm^-2 s^-1 MeV^-1]
+#   - average prompt line flux                     [cm^-2 s^-1]
+#   - binned total average flux                   [cm^-2 s^-1 MeV^-1]
+#   - per-POT delayed differential fluences       [cm^-2 POT^-1 MeV^-1]
+#   - per-POT prompt line fluence                 [cm^-2 POT^-1]
+#   - binned total per-POT fluence                [cm^-2 POT^-1 MeV^-1]
 #
-# Flux model:
+# Physics scope:
 #   pi+ -> mu+ + nu_mu         (prompt, monochromatic)
-#   mu+ -> e+ + nu_e + anti-nu_mu  (delayed, Michel spectra)
+#   mu+ -> e+ + nu_e + anti-nu_mu  (delayed Michel spectra)
 #
-# Units:
-#   Energies in MeV unless stated otherwise
-#   Average fluxes in neutrinos / (cm^2 s MeV)
-#   Per-POT fluences in neutrinos / (cm^2 POT MeV)
+# Normalization:
+#   source yield per proton per flavor is treated as an effective benchmark
+#   input, not a first-principles hadron-production calculation.
+#
+# Geometry:
+#   point source with 1 / (4 pi L^2) dilution only.
+#
+# Timing:
+#   two bunches per spill are exposed as metadata. They are not yet folded into
+#   the flux shape or a detailed time-distribution model.
 # ============================================================
 
-# ---------- Physical constants ----------
-ELEM_CHARGE_J = 1.602176634e-19  # J/eV
+ELEM_CHARGE_J = 1.602176634e-19  # J / eV
 M_PI_MEV = 139.57039
 M_MU_MEV = 105.6583755
 
-# prompt nu_mu energy from pion decay at rest
 E_NU_MU_PROMPT_MEV = (M_PI_MEV**2 - M_MU_MEV**2) / (2.0 * M_PI_MEV)
-
-# endpoint of Michel spectra from mu+ decay at rest
 E_NU_MAX_MEV = M_MU_MEV / 2.0
 
 OUTPUT_DIR = "jparc_mlf_flux_output"
@@ -39,63 +46,96 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 class JPARCMLFBeamConfig:
+    """J-PARC MLF benchmark beam metadata for semi-analytic DAR source estimates.
+
+    Parameters
+    ----------
+    beam_power_MW
+        Average proton-beam power in MW.
+    proton_energy_GeV
+        Proton kinetic energy in GeV.
+    repetition_rate_Hz
+        Spill repetition rate in Hz.
+    bunches_per_spill
+        Number of narrow bunches per spill. Kept as metadata for timing studies.
+    bunch_width_s
+        Approximate RMS-scale bunch width metadata. Not used in the flux shape.
+    bunch_spacing_s
+        Approximate spacing between the two bunches in a spill. Metadata only.
+    neutrino_yield_per_proton_per_flavor
+        Effective source yield per incoming proton and per neutrino flavor.
+        The default 0.48 is a practical benchmark normalization for J-PARC MLF.
+    yield_fractional_uncertainty
+        Optional fractional normalization uncertainty on the source yield.
+        It is exposed in metadata and summaries, but not propagated further.
     """
-    J-PARC MLF beam configuration for DAR neutrino flux estimates.
-    """
+
     def __init__(
         self,
-        beam_power_MW=1.0,
-        proton_energy_GeV=3.0,
-        repetition_rate_Hz=25.0,
-        bunches_per_spill=2,
-        bunch_width_s=100e-9,
-        neutrino_yield_per_proton_per_flavor=0.48,
-    ):
+        beam_power_MW: float = 1.0,
+        proton_energy_GeV: float = 3.0,
+        repetition_rate_Hz: float = 25.0,
+        bunches_per_spill: int = 2,
+        bunch_width_s: float = 100e-9,
+        bunch_spacing_s: float = 600e-9,
+        neutrino_yield_per_proton_per_flavor: float = 0.48,
+        yield_fractional_uncertainty: float = 0.0,
+    ) -> None:
         self.beam_power_MW = beam_power_MW
         self.proton_energy_GeV = proton_energy_GeV
         self.repetition_rate_Hz = repetition_rate_Hz
         self.bunches_per_spill = bunches_per_spill
         self.bunch_width_s = bunch_width_s
+        self.bunch_spacing_s = bunch_spacing_s
         self.neutrino_yield_per_proton_per_flavor = neutrino_yield_per_proton_per_flavor
+        self.yield_fractional_uncertainty = yield_fractional_uncertainty
 
     @property
-    def beam_power_W(self):
+    def beam_power_W(self) -> float:
         return self.beam_power_MW * 1e6
 
     @property
-    def proton_energy_J(self):
+    def proton_energy_J(self) -> float:
         return self.proton_energy_GeV * 1e9 * ELEM_CHARGE_J
 
     @property
-    def protons_per_second(self):
+    def protons_per_second(self) -> float:
         return self.beam_power_W / self.proton_energy_J
 
     @property
-    def protons_per_pulse(self):
+    def protons_per_pulse(self) -> float:
         return self.protons_per_second / self.repetition_rate_Hz
 
     @property
-    def duty_factor(self):
+    def protons_per_bunch(self) -> float:
+        return self.protons_per_pulse / self.bunches_per_spill
+
+    @property
+    def duty_factor(self) -> float:
         return self.repetition_rate_Hz * self.bunches_per_spill * self.bunch_width_s
 
     @property
-    def neutrinos_per_second_per_flavor(self):
+    def spill_timing_window_s(self) -> float:
+        if self.bunches_per_spill <= 1:
+            return self.bunch_width_s
+        return self.bunches_per_spill * self.bunch_width_s + (self.bunches_per_spill - 1) * self.bunch_spacing_s
+
+    @property
+    def neutrinos_per_second_per_flavor(self) -> float:
         return self.protons_per_second * self.neutrino_yield_per_proton_per_flavor
 
     @property
-    def neutrinos_per_year_per_flavor(self):
-        seconds_per_year = 365.25 * 24 * 3600
+    def neutrinos_per_pulse_per_flavor(self) -> float:
+        return self.protons_per_pulse * self.neutrino_yield_per_proton_per_flavor
+
+    @property
+    def neutrinos_per_year_per_flavor(self) -> float:
+        seconds_per_year = 365.25 * 24.0 * 3600.0
         return self.neutrinos_per_second_per_flavor * seconds_per_year
 
 
-def michel_spectrum_nue(E_MeV):
-    """
-    Normalized differential spectrum f_nue(E) for mu+ DAR:
-    integral_0^{m_mu/2} f(E) dE = 1
-    Units: 1 / MeV
-    Formula:
-        f_nue(E) = (192/m_mu) * (E/m_mu)^2 * (1/2 - E/m_mu)
-    """
+def michel_spectrum_nue(E_MeV: np.ndarray | float) -> np.ndarray:
+    """Normalized delayed nu_e spectrum from mu+ DAR in units of MeV^-1."""
     E = np.asarray(E_MeV, dtype=float)
     out = np.zeros_like(E)
     mask = (E >= 0.0) & (E <= E_NU_MAX_MEV)
@@ -104,14 +144,8 @@ def michel_spectrum_nue(E_MeV):
     return out
 
 
-def michel_spectrum_numubar(E_MeV):
-    """
-    Normalized differential spectrum f_numubar(E) for mu+ DAR:
-    integral_0^{m_mu/2} f(E) dE = 1
-    Units: 1 / MeV
-    Formula:
-        f_numubar(E) = (64/m_mu) * (E/m_mu)^2 * (3/4 - E/m_mu)
-    """
+def michel_spectrum_numubar(E_MeV: np.ndarray | float) -> np.ndarray:
+    """Normalized delayed anti-nu_mu spectrum from mu+ DAR in units of MeV^-1."""
     E = np.asarray(E_MeV, dtype=float)
     out = np.zeros_like(E)
     mask = (E >= 0.0) & (E <= E_NU_MAX_MEV)
@@ -120,147 +154,193 @@ def michel_spectrum_numubar(E_MeV):
     return out
 
 
-def isotropic_geometry_factor_cm2(distance_m):
-    """
-    1 / (4 pi r^2), with r in cm.
-    Result units: 1 / cm^2
-    """
+def isotropic_geometry_factor_cm2(distance_m: float) -> float:
+    """Return the point-source dilution factor 1 / (4 pi L^2) in cm^-2."""
     r_cm = distance_m * 100.0
     return 1.0 / (4.0 * np.pi * r_cm**2)
 
 
-# =========================
-# Per-POT fluence functions
-# =========================
-
-def prompt_numu_line_fluence_per_pot(distance_m, beam=None):
-    """
-    Integrated prompt nu_mu line fluence per POT at distance_m.
-    Units: neutrinos / (cm^2 POT)
-    """
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
-    geom = isotropic_geometry_factor_cm2(distance_m)
-    return beam.neutrino_yield_per_proton_per_flavor * geom
-
-
-def differential_fluence_delayed_per_pot(E_MeV, distance_m, flavor, beam=None):
-    """
-    Delayed differential fluence per POT at distance_m.
-    flavor = 'nue' or 'numubar'
-    Units: neutrinos / (cm^2 POT MeV)
-    """
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
-    geom = isotropic_geometry_factor_cm2(distance_m)
-    source_yield = beam.neutrino_yield_per_proton_per_flavor
-
+def _delayed_shape(E_MeV: np.ndarray | float, flavor: str) -> np.ndarray:
     if flavor == "nue":
-        shape = michel_spectrum_nue(E_MeV)
-    elif flavor == "numubar":
-        shape = michel_spectrum_numubar(E_MeV)
-    else:
-        raise ValueError("flavor must be 'nue' or 'numubar'")
-
-    return source_yield * geom * shape
+        return michel_spectrum_nue(E_MeV)
+    if flavor == "numubar":
+        return michel_spectrum_numubar(E_MeV)
+    raise ValueError("flavor must be 'nue' or 'numubar'")
 
 
-def binned_prompt_numu_fluence_per_pot(E_edges_MeV, distance_m, beam=None):
-    """
-    Put the monochromatic prompt nu_mu line into an energy histogram.
-    Returns bin-averaged differential fluence in each bin:
-      neutrinos / (cm^2 POT MeV)
-    """
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
+def _binned_line_density(E_edges_MeV: np.ndarray, line_energy_MeV: float, line_intensity: float) -> np.ndarray:
+    """Represent a monochromatic line as a histogram-bin average density."""
     edges = np.asarray(E_edges_MeV, dtype=float)
-    if np.any(np.diff(edges) <= 0):
+    if np.any(np.diff(edges) <= 0.0):
         raise ValueError("E_edges_MeV must be strictly increasing")
 
     vals = np.zeros(len(edges) - 1, dtype=float)
-    line_fluence = prompt_numu_line_fluence_per_pot(distance_m, beam=beam)
-    E0 = E_NU_MU_PROMPT_MEV
-
-    idx = np.searchsorted(edges, E0, side="right") - 1
+    idx = np.searchsorted(edges, line_energy_MeV, side="right") - 1
     if 0 <= idx < len(vals):
         width = edges[idx + 1] - edges[idx]
-        vals[idx] = line_fluence / width
-
+        vals[idx] = line_intensity / width
     return vals
 
 
-# =========================
-# Average flux functions
-# =========================
-
-def differential_flux_delayed(E_MeV, distance_m, flavor, beam=None):
-    """
-    Differential average flux at distance_m for delayed components:
-      flavor = 'nue' or 'numubar'
-    Returns neutrinos / (cm^2 s MeV)
-    """
+def prompt_numu_line_flux(distance_m: float, beam: JPARCMLFBeamConfig | None = None) -> float:
+    """Integrated prompt nu_mu average line flux in neutrinos / (cm^2 s)."""
     if beam is None:
         beam = JPARCMLFBeamConfig()
-
-    geom = isotropic_geometry_factor_cm2(distance_m)
-    source_rate = beam.neutrinos_per_second_per_flavor
-
-    if flavor == "nue":
-        shape = michel_spectrum_nue(E_MeV)
-    elif flavor == "numubar":
-        shape = michel_spectrum_numubar(E_MeV)
-    else:
-        raise ValueError("flavor must be 'nue' or 'numubar'")
-
-    return source_rate * geom * shape
+    return beam.neutrinos_per_second_per_flavor * isotropic_geometry_factor_cm2(distance_m)
 
 
-def prompt_numu_line_flux(distance_m, beam=None):
-    """
-    Integrated prompt nu_mu line average flux at distance_m.
-    Units: neutrinos / (cm^2 s)
-    """
+def prompt_numu_line_fluence_per_pot(distance_m: float, beam: JPARCMLFBeamConfig | None = None) -> float:
+    """Integrated prompt nu_mu fluence per POT in neutrinos / (cm^2 POT)."""
     if beam is None:
         beam = JPARCMLFBeamConfig()
-
-    geom = isotropic_geometry_factor_cm2(distance_m)
-    source_rate = beam.neutrinos_per_second_per_flavor
-    return source_rate * geom
+    return beam.neutrino_yield_per_proton_per_flavor * isotropic_geometry_factor_cm2(distance_m)
 
 
-def binned_prompt_numu_flux(E_edges_MeV, distance_m, beam=None):
-    """
-    Put the monochromatic prompt nu_mu line into an energy histogram.
-    Returns bin-averaged differential flux in each bin:
-      neutrinos / (cm^2 s MeV)
-    """
+def differential_flux_delayed(
+    E_MeV: np.ndarray | float,
+    distance_m: float,
+    flavor: str,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> np.ndarray:
+    """Delayed differential average flux in neutrinos / (cm^2 s MeV)."""
     if beam is None:
         beam = JPARCMLFBeamConfig()
+    return (
+        beam.neutrinos_per_second_per_flavor
+        * isotropic_geometry_factor_cm2(distance_m)
+        * _delayed_shape(E_MeV, flavor)
+    )
 
+
+def differential_fluence_delayed_per_pot(
+    E_MeV: np.ndarray | float,
+    distance_m: float,
+    flavor: str,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> np.ndarray:
+    """Delayed differential fluence per POT in neutrinos / (cm^2 POT MeV)."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
+    return (
+        beam.neutrino_yield_per_proton_per_flavor
+        * isotropic_geometry_factor_cm2(distance_m)
+        * _delayed_shape(E_MeV, flavor)
+    )
+
+
+def binned_prompt_numu_flux(
+    E_edges_MeV: np.ndarray,
+    distance_m: float,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> np.ndarray:
+    """Histogrammed prompt nu_mu line as average flux density in cm^-2 s^-1 MeV^-1."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
+    return _binned_line_density(E_edges_MeV, E_NU_MU_PROMPT_MEV, prompt_numu_line_flux(distance_m, beam=beam))
+
+
+def binned_prompt_numu_fluence_per_pot(
+    E_edges_MeV: np.ndarray,
+    distance_m: float,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> np.ndarray:
+    """Histogrammed prompt nu_mu line as fluence density in cm^-2 POT^-1 MeV^-1."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
+    return _binned_line_density(
+        E_edges_MeV,
+        E_NU_MU_PROMPT_MEV,
+        prompt_numu_line_fluence_per_pot(distance_m, beam=beam),
+    )
+
+
+def total_differential_flux(
+    E_MeV: np.ndarray,
+    distance_m: float,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> dict[str, np.ndarray]:
+    """Return delayed average differential flux components on a point grid."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
+    E = np.asarray(E_MeV, dtype=float)
+    phi_nue = differential_flux_delayed(E, distance_m, "nue", beam=beam)
+    phi_numubar = differential_flux_delayed(E, distance_m, "numubar", beam=beam)
+    return {
+        "E_MeV": E,
+        "phi_nue": phi_nue,
+        "phi_numubar": phi_numubar,
+        "phi_delayed_sum": phi_nue + phi_numubar,
+    }
+
+
+def total_differential_fluence_per_pot(
+    E_MeV: np.ndarray,
+    distance_m: float,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> dict[str, np.ndarray]:
+    """Return delayed differential fluence-per-POT components on a point grid."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
+    E = np.asarray(E_MeV, dtype=float)
+    Phi_nue = differential_fluence_delayed_per_pot(E, distance_m, "nue", beam=beam)
+    Phi_numubar = differential_fluence_delayed_per_pot(E, distance_m, "numubar", beam=beam)
+    return {
+        "E_MeV": E,
+        "Phi_nue": Phi_nue,
+        "Phi_numubar": Phi_numubar,
+        "Phi_delayed_sum": Phi_nue + Phi_numubar,
+    }
+
+
+def binned_total_flux(
+    E_edges_MeV: np.ndarray,
+    distance_m: float,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> dict[str, np.ndarray]:
+    """Return the binned total average flux, including the prompt line bin."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
     edges = np.asarray(E_edges_MeV, dtype=float)
-    if np.any(np.diff(edges) <= 0):
-        raise ValueError("E_edges_MeV must be strictly increasing")
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    phi_numu_prompt_binned = binned_prompt_numu_flux(edges, distance_m, beam=beam)
+    phi_nue = differential_flux_delayed(centers, distance_m, "nue", beam=beam)
+    phi_numubar = differential_flux_delayed(centers, distance_m, "numubar", beam=beam)
+    return {
+        "E_low_MeV": edges[:-1],
+        "E_high_MeV": edges[1:],
+        "E_center_MeV": centers,
+        "phi_numu_prompt_binned": phi_numu_prompt_binned,
+        "phi_nue": phi_nue,
+        "phi_numubar": phi_numubar,
+        "phi_total": phi_numu_prompt_binned + phi_nue + phi_numubar,
+    }
 
-    vals = np.zeros(len(edges) - 1, dtype=float)
-    line_flux = prompt_numu_line_flux(distance_m, beam=beam)
-    E0 = E_NU_MU_PROMPT_MEV
 
-    idx = np.searchsorted(edges, E0, side="right") - 1
-    if 0 <= idx < len(vals):
-        width = edges[idx + 1] - edges[idx]
-        vals[idx] = line_flux / width
+def binned_total_fluence_per_pot(
+    E_edges_MeV: np.ndarray,
+    distance_m: float,
+    beam: JPARCMLFBeamConfig | None = None,
+) -> dict[str, np.ndarray]:
+    """Return the binned total fluence per POT, including the prompt line bin."""
+    if beam is None:
+        beam = JPARCMLFBeamConfig()
+    edges = np.asarray(E_edges_MeV, dtype=float)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    Phi_numu_prompt_binned = binned_prompt_numu_fluence_per_pot(edges, distance_m, beam=beam)
+    Phi_nue = differential_fluence_delayed_per_pot(centers, distance_m, "nue", beam=beam)
+    Phi_numubar = differential_fluence_delayed_per_pot(centers, distance_m, "numubar", beam=beam)
+    return {
+        "E_low_MeV": edges[:-1],
+        "E_high_MeV": edges[1:],
+        "E_center_MeV": centers,
+        "Phi_numu_prompt_binned": Phi_numu_prompt_binned,
+        "Phi_nue": Phi_nue,
+        "Phi_numubar": Phi_numubar,
+        "Phi_total": Phi_numu_prompt_binned + Phi_nue + Phi_numubar,
+    }
 
-    return vals
 
-
-# =========================
-# CSV helpers
-# =========================
-
-def save_point_flux_csv(filename, E_MeV, phi_nue, phi_numubar, phi_delayed_sum):
+def save_point_flux_csv(filename: str, E_MeV: np.ndarray, phi_nue: np.ndarray, phi_numubar: np.ndarray, phi_delayed_sum: np.ndarray) -> None:
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -273,16 +353,7 @@ def save_point_flux_csv(filename, E_MeV, phi_nue, phi_numubar, phi_delayed_sum):
             writer.writerow(row)
 
 
-def save_binned_flux_csv(filename, E_edges_MeV, phi_numu_prompt_binned, beam=None, distance_m=24.0):
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
-    edges = np.asarray(E_edges_MeV, dtype=float)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    phi_nue = differential_flux_delayed(centers, distance_m, "nue", beam=beam)
-    phi_numubar = differential_flux_delayed(centers, distance_m, "numubar", beam=beam)
-    phi_total = phi_numu_prompt_binned + phi_nue + phi_numubar
-
+def save_binned_flux_csv(filename: str, binned_flux: dict[str, np.ndarray]) -> None:
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -294,11 +365,25 @@ def save_binned_flux_csv(filename, E_edges_MeV, phi_numu_prompt_binned, beam=Non
             "phi_numubar_per_cm2_s_MeV",
             "phi_total_per_cm2_s_MeV",
         ])
-        for row in zip(edges[:-1], edges[1:], centers, phi_numu_prompt_binned, phi_nue, phi_numubar, phi_total):
+        for row in zip(
+            binned_flux["E_low_MeV"],
+            binned_flux["E_high_MeV"],
+            binned_flux["E_center_MeV"],
+            binned_flux["phi_numu_prompt_binned"],
+            binned_flux["phi_nue"],
+            binned_flux["phi_numubar"],
+            binned_flux["phi_total"],
+        ):
             writer.writerow(row)
 
 
-def save_point_fluence_per_pot_csv(filename, E_MeV, Phi_nue, Phi_numubar, Phi_delayed_sum):
+def save_point_fluence_per_pot_csv(
+    filename: str,
+    E_MeV: np.ndarray,
+    Phi_nue: np.ndarray,
+    Phi_numubar: np.ndarray,
+    Phi_delayed_sum: np.ndarray,
+) -> None:
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -311,16 +396,7 @@ def save_point_fluence_per_pot_csv(filename, E_MeV, Phi_nue, Phi_numubar, Phi_de
             writer.writerow(row)
 
 
-def save_binned_fluence_per_pot_csv(filename, E_edges_MeV, Phi_numu_prompt_binned, beam=None, distance_m=24.0):
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
-    edges = np.asarray(E_edges_MeV, dtype=float)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    Phi_nue = differential_fluence_delayed_per_pot(centers, distance_m, "nue", beam=beam)
-    Phi_numubar = differential_fluence_delayed_per_pot(centers, distance_m, "numubar", beam=beam)
-    Phi_total = Phi_numu_prompt_binned + Phi_nue + Phi_numubar
-
+def save_binned_fluence_per_pot_csv(filename: str, binned_fluence: dict[str, np.ndarray]) -> None:
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -332,19 +408,23 @@ def save_binned_fluence_per_pot_csv(filename, E_edges_MeV, Phi_numu_prompt_binne
             "Phi_numubar_per_cm2_POT_MeV",
             "Phi_total_per_cm2_POT_MeV",
         ])
-        for row in zip(edges[:-1], edges[1:], centers, Phi_numu_prompt_binned, Phi_nue, Phi_numubar, Phi_total):
+        for row in zip(
+            binned_fluence["E_low_MeV"],
+            binned_fluence["E_high_MeV"],
+            binned_fluence["E_center_MeV"],
+            binned_fluence["Phi_numu_prompt_binned"],
+            binned_fluence["Phi_nue"],
+            binned_fluence["Phi_numubar"],
+            binned_fluence["Phi_total"],
+        ):
             writer.writerow(row)
 
 
-# =========================
-# Plot helpers
-# =========================
-
-def plot_point_fluxes(filename, E_MeV, phi_nue, phi_numubar, phi_delayed_sum):
+def plot_point_fluxes(filename: str, E_MeV: np.ndarray, phi_nue: np.ndarray, phi_numubar: np.ndarray, phi_delayed_sum: np.ndarray) -> None:
     plt.figure(figsize=(8, 5))
     plt.plot(E_MeV, phi_nue, label=r"$\nu_e$")
     plt.plot(E_MeV, phi_numubar, label=r"$\bar{\nu}_\mu$")
-    plt.plot(E_MeV, phi_delayed_sum, label="delayed sum", linestyle="--")
+    plt.plot(E_MeV, phi_delayed_sum, linestyle="--", label="delayed sum")
     plt.xlabel("Neutrino energy [MeV]")
     plt.ylabel(r"Differential flux [cm$^{-2}$ s$^{-1}$ MeV$^{-1}$]")
     plt.title("J-PARC MLF delayed neutrino differential flux")
@@ -355,28 +435,25 @@ def plot_point_fluxes(filename, E_MeV, phi_nue, phi_numubar, phi_delayed_sum):
     plt.close()
 
 
-def plot_binned_total_flux(filename, E_edges_MeV, phi_numu_prompt_binned, beam=None, distance_m=24.0):
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
-    edges = np.asarray(E_edges_MeV, dtype=float)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    phi_nue = differential_flux_delayed(centers, distance_m, "nue", beam=beam)
-    phi_numubar = differential_flux_delayed(centers, distance_m, "numubar", beam=beam)
-    phi_total = phi_numu_prompt_binned + phi_nue + phi_numubar
+def plot_binned_total_flux(filename: str, binned_flux: dict[str, np.ndarray]) -> None:
+    centers = binned_flux["E_center_MeV"]
+    phi_numu_prompt_binned = binned_flux["phi_numu_prompt_binned"]
+    phi_nue = binned_flux["phi_nue"]
+    phi_numubar = binned_flux["phi_numubar"]
+    phi_total = binned_flux["phi_total"]
 
     plt.figure(figsize=(8, 5))
     plt.step(centers, phi_numu_prompt_binned, where="mid", label=r"prompt $\nu_\mu$")
     plt.plot(centers, phi_nue, label=r"$\nu_e$")
     plt.plot(centers, phi_numubar, label=r"$\bar{\nu}_\mu$")
-    plt.plot(centers, phi_total, label="total", linewidth=2)
+    plt.plot(centers, phi_total, linewidth=2, label="total")
     plt.xlabel("Neutrino energy [MeV]")
     plt.ylabel(r"Differential flux [cm$^{-2}$ s$^{-1}$ MeV$^{-1}$]")
     plt.title("J-PARC MLF total neutrino differential flux (binned)")
     plt.grid(True, alpha=0.3)
     plt.yscale("log")
     positive = np.concatenate([phi_numu_prompt_binned, phi_nue, phi_numubar, phi_total])
-    positive = positive[positive > 0]
+    positive = positive[positive > 0.0]
     if positive.size:
         plt.ylim(positive.min() * 0.8, positive.max() * 1.2)
     plt.legend()
@@ -385,11 +462,11 @@ def plot_binned_total_flux(filename, E_edges_MeV, phi_numu_prompt_binned, beam=N
     plt.close()
 
 
-def plot_point_fluence_per_pot(filename, E_MeV, Phi_nue, Phi_numubar, Phi_delayed_sum):
+def plot_point_fluence_per_pot(filename: str, E_MeV: np.ndarray, Phi_nue: np.ndarray, Phi_numubar: np.ndarray, Phi_delayed_sum: np.ndarray) -> None:
     plt.figure(figsize=(8, 5))
     plt.plot(E_MeV, Phi_nue, label=r"$\nu_e$")
     plt.plot(E_MeV, Phi_numubar, label=r"$\bar{\nu}_\mu$")
-    plt.plot(E_MeV, Phi_delayed_sum, label="delayed sum", linestyle="--")
+    plt.plot(E_MeV, Phi_delayed_sum, linestyle="--", label="delayed sum")
     plt.xlabel("Neutrino energy [MeV]")
     plt.ylabel(r"Differential fluence [cm$^{-2}$ POT$^{-1}$ MeV$^{-1}$]")
     plt.title("J-PARC MLF delayed neutrino differential fluence per POT")
@@ -400,28 +477,25 @@ def plot_point_fluence_per_pot(filename, E_MeV, Phi_nue, Phi_numubar, Phi_delaye
     plt.close()
 
 
-def plot_binned_total_fluence_per_pot(filename, E_edges_MeV, Phi_numu_prompt_binned, beam=None, distance_m=24.0):
-    if beam is None:
-        beam = JPARCMLFBeamConfig()
-
-    edges = np.asarray(E_edges_MeV, dtype=float)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    Phi_nue = differential_fluence_delayed_per_pot(centers, distance_m, "nue", beam=beam)
-    Phi_numubar = differential_fluence_delayed_per_pot(centers, distance_m, "numubar", beam=beam)
-    Phi_total = Phi_numu_prompt_binned + Phi_nue + Phi_numubar
+def plot_binned_total_fluence_per_pot(filename: str, binned_fluence: dict[str, np.ndarray]) -> None:
+    centers = binned_fluence["E_center_MeV"]
+    Phi_numu_prompt_binned = binned_fluence["Phi_numu_prompt_binned"]
+    Phi_nue = binned_fluence["Phi_nue"]
+    Phi_numubar = binned_fluence["Phi_numubar"]
+    Phi_total = binned_fluence["Phi_total"]
 
     plt.figure(figsize=(8, 5))
     plt.step(centers, Phi_numu_prompt_binned, where="mid", label=r"prompt $\nu_\mu$")
     plt.plot(centers, Phi_nue, label=r"$\nu_e$")
     plt.plot(centers, Phi_numubar, label=r"$\bar{\nu}_\mu$")
-    plt.plot(centers, Phi_total, label="total", linewidth=2)
+    plt.plot(centers, Phi_total, linewidth=2, label="total")
     plt.xlabel("Neutrino energy [MeV]")
     plt.ylabel(r"Differential fluence [cm$^{-2}$ POT$^{-1}$ MeV$^{-1}$]")
     plt.title("J-PARC MLF total neutrino differential fluence per POT (binned)")
     plt.grid(True, alpha=0.3)
     plt.yscale("log")
     positive = np.concatenate([Phi_numu_prompt_binned, Phi_nue, Phi_numubar, Phi_total])
-    positive = positive[positive > 0]
+    positive = positive[positive > 0.0]
     if positive.size:
         plt.ylim(positive.min() * 0.8, positive.max() * 1.2)
     plt.legend()
@@ -432,127 +506,90 @@ def plot_binned_total_fluence_per_pot(filename, E_edges_MeV, Phi_numu_prompt_bin
 
 if __name__ == "__main__":
     beam = JPARCMLFBeamConfig()
-
-    print("=== J-PARC MLF beam configuration ===")
-    print(f"Beam power               : {beam.beam_power_MW:.3f} MW")
-    print(f"Proton kinetic energy    : {beam.proton_energy_GeV:.3f} GeV")
-    print(f"Repetition rate          : {beam.repetition_rate_Hz:.3f} Hz")
-    print(f"Bunches per spill        : {beam.bunches_per_spill:d}")
-    print(f"Bunch width             : {beam.bunch_width_s*1e9:.1f} ns")
-    print(f"Duty factor              : {beam.duty_factor:.6e}")
-    print(f"Protons/s                : {beam.protons_per_second:.6e}")
-    print(f"Protons/pulse            : {beam.protons_per_pulse:.6e}")
-    print(f"Yield per proton/flavor  : {beam.neutrino_yield_per_proton_per_flavor:.3f}")
-    print(f"Nu/s per flavor          : {beam.neutrinos_per_second_per_flavor:.6e}")
-    print(f"Nu/year per flavor       : {beam.neutrinos_per_year_per_flavor:.6e}")
-    print(f"Prompt nu_mu energy      : {E_NU_MU_PROMPT_MEV:.6f} MeV")
-    print(f"Delayed endpoint         : {E_NU_MAX_MEV:.6f} MeV")
-
     distance_m = 24.0
 
-    line_flux = prompt_numu_line_flux(distance_m, beam=beam)
-    line_fluence_per_pot = prompt_numu_line_fluence_per_pot(distance_m, beam=beam)
+    print("=== J-PARC MLF DAR benchmark summary ===")
+    print(f"Beam power                       : {beam.beam_power_MW:.3f} MW")
+    print(f"Proton kinetic energy            : {beam.proton_energy_GeV:.3f} GeV")
+    print(f"Repetition rate                  : {beam.repetition_rate_Hz:.3f} Hz")
+    print(f"Bunches per spill                : {beam.bunches_per_spill:d}")
+    print(f"Bunch width                      : {beam.bunch_width_s * 1e9:.1f} ns")
+    print(f"Bunch spacing                    : {beam.bunch_spacing_s * 1e9:.1f} ns")
+    print(f"Spill timing window              : {beam.spill_timing_window_s * 1e9:.1f} ns")
+    print("Timing note                      : metadata only; not folded into flux shape")
+    print(f"Protons/s                        : {beam.protons_per_second:.6e}")
+    print(f"Protons/pulse                    : {beam.protons_per_pulse:.6e}")
+    print(f"Protons/bunch                    : {beam.protons_per_bunch:.6e}")
+    print(f"Yield per proton per flavor      : {beam.neutrino_yield_per_proton_per_flavor:.3f}")
+    print(f"Yield fractional uncertainty     : {beam.yield_fractional_uncertainty:.3%}")
+    print(f"Neutrinos/s per flavor           : {beam.neutrinos_per_second_per_flavor:.6e}")
+    print(f"Neutrinos/pulse per flavor       : {beam.neutrinos_per_pulse_per_flavor:.6e}")
+    print(f"Neutrinos/year per flavor        : {beam.neutrinos_per_year_per_flavor:.6e}")
+    print(f"Prompt nu_mu line energy         : {E_NU_MU_PROMPT_MEV:.6f} MeV")
+    print(f"Delayed endpoint                 : {E_NU_MAX_MEV:.6f} MeV")
+    print(f"Chosen baseline                  : {distance_m:.1f} m")
+    print(f"Prompt nu_mu line flux           : {prompt_numu_line_flux(distance_m, beam=beam):.6e} /cm^2/s")
+    print(f"Prompt nu_mu line fluence / POT  : {prompt_numu_line_fluence_per_pot(distance_m, beam=beam):.6e} /cm^2/POT")
 
-    print(f"\nPrompt nu_mu line flux at {distance_m:.1f} m: {line_flux:.6e} /cm^2/s")
-    print(f"Prompt nu_mu line fluence per POT at {distance_m:.1f} m: {line_fluence_per_pot:.6e} /cm^2/POT")
-
-    # ----- fine grid for smooth delayed spectra -----
     E = np.linspace(0.0, E_NU_MAX_MEV, 500)
+    E_edges = np.linspace(0.0, E_NU_MAX_MEV, 265)
 
-    # Average fluxes
-    phi_nue = differential_flux_delayed(E, distance_m, "nue", beam=beam)
-    phi_numubar = differential_flux_delayed(E, distance_m, "numubar", beam=beam)
-    phi_delayed_sum = phi_nue + phi_numubar
+    flux_point = total_differential_flux(E, distance_m, beam=beam)
+    fluence_point = total_differential_fluence_per_pot(E, distance_m, beam=beam)
+    flux_binned = binned_total_flux(E_edges, distance_m, beam=beam)
+    fluence_binned = binned_total_fluence_per_pot(E_edges, distance_m, beam=beam)
 
-    print(f"Peak nue average differential flux      : {phi_nue.max():.6e} /cm^2/s/MeV")
-    print(f"Peak numubar average differential flux  : {phi_numubar.max():.6e} /cm^2/s/MeV")
+    print(f"Peak nue average differential flux      : {flux_point['phi_nue'].max():.6e} /cm^2/s/MeV")
+    print(f"Peak numubar average differential flux  : {flux_point['phi_numubar'].max():.6e} /cm^2/s/MeV")
+    print(f"Peak nue fluence per POT                : {fluence_point['Phi_nue'].max():.6e} /cm^2/POT/MeV")
+    print(f"Peak numubar fluence per POT            : {fluence_point['Phi_numubar'].max():.6e} /cm^2/POT/MeV")
 
-    # Per-POT fluences
-    Phi_nue = differential_fluence_delayed_per_pot(E, distance_m, "nue", beam=beam)
-    Phi_numubar = differential_fluence_delayed_per_pot(E, distance_m, "numubar", beam=beam)
-    Phi_delayed_sum = Phi_nue + Phi_numubar
-
-    print(f"Peak nue differential fluence per POT      : {Phi_nue.max():.6e} /cm^2/POT/MeV")
-    print(f"Peak numubar differential fluence per POT  : {Phi_numubar.max():.6e} /cm^2/POT/MeV")
-
-    # ----- histogram grid for total spectrum including prompt line -----
-    E_edges = np.linspace(0.0, E_NU_MAX_MEV, 265)  # ~0.2 MeV bins
-
-    phi_numu_prompt_binned = binned_prompt_numu_flux(E_edges, distance_m, beam=beam)
-    Phi_numu_prompt_binned = binned_prompt_numu_fluence_per_pot(E_edges, distance_m, beam=beam)
-
-    # ----- save average flux outputs -----
     save_point_flux_csv(
         f"{OUTPUT_DIR}/jparc_delayed_flux_point_grid.csv",
-        E,
-        phi_nue,
-        phi_numubar,
-        phi_delayed_sum,
+        flux_point["E_MeV"],
+        flux_point["phi_nue"],
+        flux_point["phi_numubar"],
+        flux_point["phi_delayed_sum"],
     )
-
-    save_binned_flux_csv(
-        f"{OUTPUT_DIR}/jparc_total_flux_binned.csv",
-        E_edges,
-        phi_numu_prompt_binned,
-        beam=beam,
-        distance_m=distance_m,
+    save_binned_flux_csv(f"{OUTPUT_DIR}/jparc_total_flux_binned.csv", flux_binned)
+    save_point_fluence_per_pot_csv(
+        f"{OUTPUT_DIR}/jparc_delayed_fluence_per_pot_point_grid.csv",
+        fluence_point["E_MeV"],
+        fluence_point["Phi_nue"],
+        fluence_point["Phi_numubar"],
+        fluence_point["Phi_delayed_sum"],
+    )
+    save_binned_fluence_per_pot_csv(
+        f"{OUTPUT_DIR}/jparc_total_fluence_per_pot_binned.csv",
+        fluence_binned,
     )
 
     plot_point_fluxes(
         f"{OUTPUT_DIR}/jparc_delayed_flux_point_grid.png",
-        E,
-        phi_nue,
-        phi_numubar,
-        phi_delayed_sum,
+        flux_point["E_MeV"],
+        flux_point["phi_nue"],
+        flux_point["phi_numubar"],
+        flux_point["phi_delayed_sum"],
     )
-
-    plot_binned_total_flux(
-        f"{OUTPUT_DIR}/jparc_total_flux_binned.png",
-        E_edges,
-        phi_numu_prompt_binned,
-        beam=beam,
-        distance_m=distance_m,
-    )
-
-    # ----- save per-POT fluence outputs -----
-    save_point_fluence_per_pot_csv(
-        f"{OUTPUT_DIR}/jparc_delayed_fluence_per_pot_point_grid.csv",
-        E,
-        Phi_nue,
-        Phi_numubar,
-        Phi_delayed_sum,
-    )
-
-    save_binned_fluence_per_pot_csv(
-        f"{OUTPUT_DIR}/jparc_total_fluence_per_pot_binned.csv",
-        E_edges,
-        Phi_numu_prompt_binned,
-        beam=beam,
-        distance_m=distance_m,
-    )
-
+    plot_binned_total_flux(f"{OUTPUT_DIR}/jparc_total_flux_binned.png", flux_binned)
     plot_point_fluence_per_pot(
         f"{OUTPUT_DIR}/jparc_delayed_fluence_per_pot_point_grid.png",
-        E,
-        Phi_nue,
-        Phi_numubar,
-        Phi_delayed_sum,
+        fluence_point["E_MeV"],
+        fluence_point["Phi_nue"],
+        fluence_point["Phi_numubar"],
+        fluence_point["Phi_delayed_sum"],
     )
-
     plot_binned_total_fluence_per_pot(
         f"{OUTPUT_DIR}/jparc_total_fluence_per_pot_binned.png",
-        E_edges,
-        Phi_numu_prompt_binned,
-        beam=beam,
-        distance_m=distance_m,
+        fluence_binned,
     )
 
     print("\nSaved files:")
     print(f"  {OUTPUT_DIR}/jparc_delayed_flux_point_grid.csv")
     print(f"  {OUTPUT_DIR}/jparc_total_flux_binned.csv")
-    print(f"  {OUTPUT_DIR}/jparc_delayed_flux_point_grid.png")
-    print(f"  {OUTPUT_DIR}/jparc_total_flux_binned.png")
     print(f"  {OUTPUT_DIR}/jparc_delayed_fluence_per_pot_point_grid.csv")
     print(f"  {OUTPUT_DIR}/jparc_total_fluence_per_pot_binned.csv")
+    print(f"  {OUTPUT_DIR}/jparc_delayed_flux_point_grid.png")
+    print(f"  {OUTPUT_DIR}/jparc_total_flux_binned.png")
     print(f"  {OUTPUT_DIR}/jparc_delayed_fluence_per_pot_point_grid.png")
     print(f"  {OUTPUT_DIR}/jparc_total_fluence_per_pot_binned.png")
